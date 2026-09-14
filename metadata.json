@@ -1,0 +1,6 @@
+{
+  "name": "CardVault Auto-Scan & Catalog",
+  "description": "Automated trading card batch scanner, slab & raw card cropper, two-sided OCR cataloger, and collection database manager.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

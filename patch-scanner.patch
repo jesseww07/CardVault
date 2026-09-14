@@ -1,0 +1,83 @@
+--- src/components/ScannerStudio.tsx
++++ src/components/ScannerStudio.tsx
+@@ -337,70 +337,42 @@
+ 
+   // Run AI OCR on all cropped cards
+   const runBatchOcr = async (cardsToProcess: CroppedSlotPair[]) => {
+     setIsProcessingOcr(true);
+     const updated = [...cardsToProcess];
+-    for (let i = 0; i < updated.length; i++) {
+-      const card = updated[i];
+-      card.status = 'processing';
+-      card.progressMessage = 'Analyzing front and back with Gemini OCR...';
+-      setCroppedCards([...updated]);
+-
+-      try {
+-        const res = await fetch('/api/ocr-card', {
+-          method: 'POST',
+-          headers: { 'Content-Type': 'application/json' },
+-          body: JSON.stringify({
+-            frontImageBase64: card.frontCroppedDataUrl,
+-            backImageBase64: card.backCroppedDataUrl,
+-            templateHint: currentTemplate.name,
+-            isSlabHint: currentTemplate.isSlab,
+-          }),
+-        });
+-
+-        if (!res.ok) {
+-          let errorMsg = `Server returned ${res.status}`;
+-          try {
+-            const errData = await res.json();
+-            if (errData.error) errorMsg = errData.error;
+-          } catch (e) {
+-            // ignore JSON parse error
+-          }
+-          throw new Error(errorMsg);
+-        }
+-
+-        const data = await res.json();
+-        card.status = 'done';
+-        card.progressMessage = 'Data Extracted';
+-        card.extractedData = {
+-          id: `card-${Date.now()}-${i}`,
+-          createdAt: Date.now(),
+-          updatedAt: Date.now(),
+-          frontImage: card.frontCroppedDataUrl,
+-          backImage: card.backCroppedDataUrl,
+-          name: data.name || `Card ${i + 1}`,
+-          year: data.year || '',
+-          set: data.set || '',
+-          cardNumber: data.cardNumber || '',
+-          category: (data.category as CardCategory) || 'Other',
+-          variation: data.variation || 'Base',
+-          isGraded: Boolean(data.isGraded),
+-          gradingCompany: (data.gradingCompany as GradingBrand) || (currentTemplate.isSlab ? currentTemplate.brand as GradingBrand : 'Raw'),
+-          grade: data.grade || (data.isGraded ? '10' : ''),
+-          certNumber: data.certNumber || '',
+-          subgrades: data.subgrades,
+-          estimatedCondition: data.estimatedCondition || (data.isGraded ? 'Graded' : 'Near Mint'),
+-          estimatedValue: typeof data.estimatedValue === 'number' ? data.estimatedValue : 15,
+-          currency: 'USD',
+-          frontOcrText: data.frontOcrText || '',
+-          backOcrText: data.backOcrText || '',
+-          tags: Array.isArray(data.tags) ? data.tags : ['Cataloged'],
+-          notes: data.notes || '',
+-          slotIndex: card.slotIndex,
+-        };
+-      } catch (err: any) {
+-        card.status = 'error';
+-        card.error = err.message || 'OCR extraction failed';
+-      }
+-
+-      setCroppedCards([...updated]);
+-      
+-      // Add a delay between cards to strictly adhere to Free Tier 15 RPM (4s per request)
+-      if (i < updated.length - 1) {
+-        await new Promise((resolve) => setTimeout(resolve, 4500));
+-      }
+-    }
+-
+-    setIsProcessingOcr(false);
+-    confetti({ particleCount: 80, spread: 70, origin: { y: 0.6 } });
+-    setStep(4);
+-  };

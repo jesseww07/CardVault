@@ -1,0 +1,109 @@
+--- server.ts
++++ server.ts
+@@ -242,3 +242,109 @@
+     });
+   }
+ });
++
++// Endpoint: Batch OCR
++app.post("/api/ocr-batch", async (req, res) => {
++  try {
++    const { cards, templateHint, isSlabHint } = req.body;
++    if (!cards || !Array.isArray(cards) || cards.length === 0) {
++      return res.status(400).json({ error: "cards array is required" });
++    }
++
++    const ai = getGeminiClient();
++    const parts: any[] = [];
++
++    let prompt = `You are an expert sports card and trading card game (TCG) authenticator, grader, and cataloger.\n`;
++    prompt += `Carefully examine the provided images of ${cards.length} trading card(s).\n`;
++    prompt += `For each card, there is a FRONT image, and optionally a BACK image.\n`;
++    prompt += `Template context hint: ${templateHint || "Standard Scan"}. Is slab hint: ${isSlabHint ? "Yes" : "Unknown"}.\n`;
++    
++    cards.forEach((c: any, index: number) => {
++      prompt += `\n--- Card ${index + 1} (ID: ${c.id}) ---\n`;
++      const cleanFront = c.frontImageBase64.replace(/^data:image\/[a-z]+;base64,/, "");
++      parts.push({ inlineData: { data: cleanFront, mimeType: "image/jpeg" } });
++      if (c.backImageBase64) {
++        const cleanBack = c.backImageBase64.replace(/^data:image\/[a-z]+;base64,/, "");
++        parts.push({ inlineData: { data: cleanBack, mimeType: "image/jpeg" } });
++      }
++    });
++
++    prompt += `\nExtract key metadata for EACH card and return an array of objects.`;
++
++    parts.push({ text: prompt });
++
++    const maxRetries = 5;
++    let attempt = 0;
++    let response;
++
++    while (attempt < maxRetries) {
++      try {
++        response = await ai.models.generateContent({
++          model: "gemini-2.5-flash",
++          contents: { parts },
++          config: {
++            responseMimeType: "application/json",
++            responseSchema: {
++              type: Type.ARRAY,
++              items: {
++                type: Type.OBJECT,
++                properties: {
++                  id: { type: Type.STRING },
++                  name: { type: Type.STRING },
++                  year: { type: Type.STRING },
++                  set: { type: Type.STRING },
++                  cardNumber: { type: Type.STRING },
++                  category: { type: Type.STRING },
++                  variation: { type: Type.STRING },
++                  isGraded: { type: Type.BOOLEAN },
++                  gradingCompany: { type: Type.STRING },
++                  grade: { type: Type.STRING },
++                  certNumber: { type: Type.STRING },
++                  subgrades: {
++                    type: Type.OBJECT,
++                    properties: {
++                      centering: { type: Type.STRING },
++                      corners: { type: Type.STRING },
++                      edges: { type: Type.STRING },
++                      surface: { type: Type.STRING },
++                      auto: { type: Type.STRING },
++                    },
++                  },
++                  estimatedCondition: { type: Type.STRING },
++                  estimatedValue: { type: Type.NUMBER },
++                  tags: {
++                    type: Type.ARRAY,
++                    items: { type: Type.STRING },
++                  },
++                  frontOcrText: { type: Type.STRING },
++                  backOcrText: { type: Type.STRING },
++                  notes: { type: Type.STRING },
++                },
++                required: ["id", "name", "year", "set", "cardNumber", "category", "isGraded", "gradingCompany"],
++              }
++            },
++          },
++        });
++        break;
++      } catch (err: any) {
++        attempt++;
++        if (attempt >= maxRetries) throw err;
++        const errString = err.message || JSON.stringify(err);
++        let baseDelay = errString.includes('429') ? 10000 : 4000;
++        const delay = baseDelay * Math.pow(1.5, attempt - 1) + Math.random() * 1000;
++        console.log(`Batch OCR attempt ${attempt} failed, retrying in ${Math.round(delay)}ms...`, err.message);
++        await new Promise((resolve) => setTimeout(resolve, delay));
++      }
++    }
++
++    const text = response?.text || "[]";
++    const parsed = JSON.parse(text);
++    return res.json(parsed);
++  } catch (error: any) {
++    console.error("Batch OCR error:", error);
++    return res.status(500).json({ error: error.message || "Failed to extract card data" });
++  }
++});
