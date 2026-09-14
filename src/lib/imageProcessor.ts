@@ -1,6 +1,7 @@
 import UTIF from 'utif';
 import * as pdfjsLib from 'pdfjs-dist';
 import { ScannerSlot, FlipMode, ScannerTemplate, CroppedSlotPair } from '../types';
+import { detectCardsInElement, quadToSlot, DetectOptions, DetectionResult } from './cardDetector';
 
 if (typeof window !== 'undefined' && !pdfjsLib.GlobalWorkerOptions.workerSrc) {
   pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.mjs`;
@@ -360,110 +361,19 @@ export async function optimizeCroppedCardForOcr(
 }
 
 /**
- * Fast client-side Computer Vision contour & edge detector for flatbed scanner beds.
- * Identifies high-contrast rectangular card regions against white/black/gray scanner glass.
+ * Local (no API) card edge detection. Returns rotated, edge-refined slots in reading order
+ * plus a confidence score used to decide whether an AI detection call is needed.
  */
 export async function detectCardEdgesCV(
-  imageSource: string | HTMLImageElement
-): Promise<ScannerSlot[]> {
+  imageSource: string | HTMLImageElement,
+  options: DetectOptions = {}
+): Promise<{ slots: ScannerSlot[]; result: DetectionResult }> {
   const img = typeof imageSource === 'string' ? await loadImage(imageSource) : imageSource;
-  const canvas = document.createElement('canvas');
-  const w = Math.min(800, img.naturalWidth);
-  const h = Math.round((w / img.naturalWidth) * img.naturalHeight);
-  canvas.width = w;
-  canvas.height = h;
-
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return [];
-
-  ctx.drawImage(img, 0, 0, w, h);
-  const imgData = ctx.getImageData(0, 0, w, h);
-  const data = imgData.data;
-
-  // Sample corner background color (scanner lid color)
-  let bgR = 0, bgG = 0, bgB = 0, bgCount = 0;
-  const cornerPts = [
-    [10, 10], [w - 10, 10], [10, h - 10], [w - 10, h - 10],
-    [Math.floor(w / 2), 10], [10, Math.floor(h / 2)]
-  ];
-  for (const [cx, cy] of cornerPts) {
-    const idx = (cy * w + cx) * 4;
-    bgR += data[idx];
-    bgG += data[idx + 1];
-    bgB += data[idx + 2];
-    bgCount++;
-  }
-  bgR /= bgCount;
-  bgG /= bgCount;
-  bgB /= bgCount;
-
-  // Threshold difference map
-  const threshold = 32;
-  const binary = new Uint8Array(w * h);
-
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const idx = (y * w + x) * 4;
-      const diff = Math.abs(data[idx] - bgR) + Math.abs(data[idx + 1] - bgG) + Math.abs(data[idx + 2] - bgB);
-      binary[y * w + x] = diff > threshold ? 1 : 0;
-    }
-  }
-
-  // Find bounding boxes using grid projection / connected blobs
-  const gridRows = 4;
-  const gridCols = 2;
-  const detected: ScannerSlot[] = [];
-
-  const cellW = w / gridCols;
-  const cellH = h / gridRows;
-
-  let slotId = 0;
-  for (let r = 0; r < gridRows; r++) {
-    for (let c = 0; c < gridCols; c++) {
-      const startX = Math.floor(c * cellW + cellW * 0.05);
-      const endX = Math.floor((c + 1) * cellW - cellW * 0.05);
-      const startY = Math.floor(r * cellH + cellH * 0.05);
-      const endY = Math.floor((r + 1) * cellH - cellH * 0.05);
-
-      let minX = endX, maxX = startX, minY = endY, maxY = startY;
-      let count = 0;
-
-      for (let y = startY; y < endY; y += 2) {
-        for (let x = startX; x < endX; x += 2) {
-          if (binary[y * w + x] === 1) {
-            count++;
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-          }
-        }
-      }
-
-      // If significant pixels found in cell, create slot
-      if (count > (cellW * cellH * 0.08) && maxX > minX && maxY > minY) {
-        const padX = (maxX - minX) * 0.03;
-        const padY = (maxY - minY) * 0.03;
-        const finalMinX = Math.max(0, minX - padX);
-        const finalMaxX = Math.min(w, maxX + padX);
-        const finalMinY = Math.max(0, minY - padY);
-        const finalMaxY = Math.min(h, maxY + padY);
-
-        detected.push({
-          id: slotId++,
-          active: true,
-          xPercent: (finalMinX / w) * 100,
-          yPercent: (finalMinY / h) * 100,
-          widthPercent: ((finalMaxX - finalMinX) / w) * 100,
-          heightPercent: ((finalMaxY - finalMinY) / h) * 100,
-          label: `Card ${detected.length + 1}`,
-          rotation: 0,
-        });
-      }
-    }
-  }
-
-  return detected;
+  const result = detectCardsInElement(img, options);
+  const slots = result.quads.map((q, i) =>
+    quadToSlot(q, result.sourceWidth, result.sourceHeight, i, `Card ${i + 1}`)
+  );
+  return { slots, result };
 }
 
 export async function cropSlotFromImage(
@@ -485,7 +395,9 @@ export async function cropSlotFromImage(
   let sourceCanvas: HTMLCanvasElement;
   let sourceCtx: CanvasRenderingContext2D | null;
 
-  const totalDeskew = (slot.deskewAngle || 0) + rotationAngle + skewAngle;
+  // Per-slot deskew rotates around the slot's own center (see below); global angles rotate the whole scan.
+  const slotDeskew = slot.deskewAngle || 0;
+  const totalDeskew = rotationAngle + skewAngle;
 
   if (totalDeskew !== 0) {
     sourceCanvas = document.createElement('canvas');
@@ -519,6 +431,33 @@ export async function cropSlotFromImage(
   let cropW = Math.round((slot.widthPercent / 100) * sourceCanvas.width);
   let cropH = Math.round((slot.heightPercent / 100) * sourceCanvas.height);
 
+  const effectiveRotation = ((slot.rotation || 0) + (slotRotation || 0)) % 360;
+  const isSwap = Math.abs(effectiveRotation % 180) === 90;
+
+  if (slotDeskew !== 0) {
+    // Rotated crop: map the slot center to the target center, then rotate by deskew + orientation.
+    // Margins are applied symmetrically (no clamping) so the card stays centered; pixels falling
+    // outside the scan are filled with the matting color.
+    const outW = Math.round(cropW * (1 + (2 * edgeMarginPercent) / 100));
+    const outH = Math.round(cropH * (1 + (2 * edgeMarginPercent) / 100));
+    const targetCanvas = document.createElement('canvas');
+    targetCanvas.width = Math.max(1, isSwap ? outH : outW);
+    targetCanvas.height = Math.max(1, isSwap ? outW : outH);
+    const targetCtx = targetCanvas.getContext('2d');
+    if (!targetCtx) throw new Error('Failed to acquire target canvas context');
+
+    const matteColors = { dark: '#0f172a', black: '#000000', white: '#ffffff', original: '#ffffff' };
+    targetCtx.fillStyle = matteColors[mattingBackground];
+    targetCtx.fillRect(0, 0, targetCanvas.width, targetCanvas.height);
+    targetCtx.imageSmoothingEnabled = true;
+    targetCtx.imageSmoothingQuality = 'high';
+    targetCtx.translate(targetCanvas.width / 2, targetCanvas.height / 2);
+    targetCtx.rotate(((effectiveRotation + slotDeskew) * Math.PI) / 180);
+    targetCtx.drawImage(sourceCanvas, -(cropX + cropW / 2), -(cropY + cropH / 2));
+
+    return targetCanvas.toDataURL('image/jpeg', 0.94);
+  }
+
   // Apply edge margin padding if requested so 100% of card borders/corners are clearly visible
   if (edgeMarginPercent > 0) {
     const padW = Math.round(cropW * (edgeMarginPercent / 100));
@@ -534,9 +473,6 @@ export async function cropSlotFromImage(
   const safeY = Math.max(0, Math.min(cropY, sourceCanvas.height - 2));
   const safeW = Math.max(1, Math.min(cropW, sourceCanvas.width - safeX));
   const safeH = Math.max(1, Math.min(cropH, sourceCanvas.height - safeY));
-
-  const effectiveRotation = ((slot.rotation || 0) + (slotRotation || 0)) % 360;
-  const isSwap = Math.abs(effectiveRotation % 180) === 90;
 
   const targetCanvas = document.createElement('canvas');
   targetCanvas.width = isSwap ? safeH : safeW;

@@ -41,14 +41,62 @@ import {
   loadImage,
   processUploadFile,
   rotateImageDataUrl,
-  detectCardEdgesCV,
   createOptimizedScanForApi,
   optimizeCroppedCardForOcr,
 } from '../lib/imageProcessor';
+import {
+  CardQuad,
+  createRegionReader,
+  detectCardsInElement,
+  matchQuad,
+  mirrorSlot,
+  pairBackSlotsForActiveFronts,
+  quadToSlot,
+  refineQuad,
+  slotToQuad,
+  sortReadingOrder,
+} from '../lib/cardDetector';
 import { createPsaSlabDemoScan, createRaw9CardDemoScan, createRaw8LetterDemoScan, createLooseRaw8CardsDemoScan } from '../lib/sampleScans';
 import { AutoEdgeControls } from './AutoEdgeControls';
 import { InspectQualityModal } from './InspectQualityModal';
 
+
+/** Single AI detection call. Returns null on failure or when the server returned its canned fallback grid. */
+async function detectCardsWithApi(scanUrl: string, width: number, height: number): Promise<CardQuad[] | null> {
+  try {
+    const optimized = await createOptimizedScanForApi(scanUrl, 1400, 0.82);
+    const res = await fetch('/api/detect-cards', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64: optimized }),
+    });
+    const contentType = res.headers.get('content-type') || '';
+    if (!res.ok || !contentType.includes('application/json')) {
+      console.warn(`Card detection API status ${res.status} (${contentType})`);
+      return null;
+    }
+    const data = await res.json();
+    if (data.fallback || !Array.isArray(data.detectedCards)) return null;
+    return data.detectedCards.map((c: any): CardQuad => {
+      const [ymin, xmin, ymax, xmax] = c.box_2d;
+      const w = ((xmax - xmin) / 1000) * width;
+      const h = ((ymax - ymin) / 1000) * height;
+      return {
+        cx: ((xmin + xmax) / 2000) * width,
+        cy: ((ymin + ymax) / 2000) * height,
+        width: w,
+        height: h,
+        angleDeg: 0,
+        rectangularity: 1,
+        aspectScore: 1,
+        refined: false,
+      };
+    });
+  } catch (e) {
+    console.warn('AI detection request failed, using local detection:', e);
+    return null;
+  }
+}
 
 interface ScannerStudioProps {
   templates: ScannerTemplate[];
@@ -424,6 +472,12 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
 
           // Slot boundary (Base Box)
           ctx.save();
+          if (slot.deskewAngle) {
+            // Show the tilted region that will actually be cropped
+            ctx.translate(x + w / 2, y + h / 2);
+            ctx.rotate((-slot.deskewAngle * Math.PI) / 180);
+            ctx.translate(-(x + w / 2), -(y + h / 2));
+          }
           if (slot.active) {
             ctx.strokeStyle = isSelected ? '#22d3ee' : '#06b6d4';
             ctx.lineWidth = isSelected ? 4 : 2;
@@ -495,135 +549,63 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
     }
   }, [step, renderAlignmentCanvas]);
 
-  // AI & CV Edge Detection and Normalization Handler
+  // Local-first edge detection: AI is only called when the local detector is not confident
   const handleAutoDetectCards = async () => {
     if (!frontScanUrl) return;
     setIsProcessingOcr(true);
     setCropError(null);
 
+    const detectOptions =
+      currentTemplate.type === 'auto-detect'
+        ? {}
+        : { expectedCount: currentTemplate.rows * currentTemplate.cols, aspectRatio: currentTemplate.aspectRatio };
+
     try {
-      // 1. Detect Front Card Edges
-      let frontDetected: ScannerSlot[] = [];
-      try {
-        // Create an optimized, lightweight scan (<300KB) to ensure rapid transfer without hitting reverse proxy body limits
-        const optimizedFront = await createOptimizedScanForApi(frontScanUrl, 1400, 0.82);
+      // 1. Front: local detection
+      const frontImg = await loadImage(frontScanUrl);
+      const { width: fw, height: fh } = { width: frontImg.naturalWidth, height: frontImg.naturalHeight };
+      const local = detectCardsInElement(frontImg, detectOptions);
+      let frontQuads = local.quads;
+      console.info(
+        `Local detection: ${local.quads.length} cards, confidence ${local.confidence.toFixed(2)}`,
+        local.reasons
+      );
 
-        const res = await fetch('/api/detect-cards', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ imageBase64: optimizedFront }),
-        });
-
-        const contentType = res.headers.get('content-type') || '';
-        if (!res.ok) {
-          const errText = await res.text();
-          console.warn(`Card detection API status ${res.status}:`, errText.slice(0, 150));
-        } else if (contentType.includes('application/json')) {
-          const data = await res.json();
-          if (data.detectedCards && data.detectedCards.length > 0) {
-            frontDetected = data.detectedCards.map((c: any, idx: number) => {
-              const [ymin, xmin, ymax, xmax] = c.box_2d;
-              const isLandscape = c.isLandscape ?? (xmax - xmin > ymax - ymin);
-              return {
-                id: idx,
-                active: true,
-                xPercent: Math.max(0, xmin / 10),
-                yPercent: Math.max(0, ymin / 10),
-                widthPercent: Math.min(100, (xmax - xmin) / 10),
-                heightPercent: Math.min(100, (ymax - ymin) / 10),
-                label: `${c.detectedBrand || 'Card'} ${idx + 1}`,
-                rotation: c.orientation ?? (isLandscape ? 90 : 0),
-                deskewAngle: c.deskewAngle ?? 0,
-                isLandscape,
-              };
-            });
-          }
-        } else {
-          console.warn(`Card detection returned unexpected content type: ${contentType}`);
+      // 2. Low confidence: one AI call, then snap its rough boxes to real edges
+      if (!local.confident) {
+        const aiQuads = await detectCardsWithApi(frontScanUrl, fw, fh);
+        if (aiQuads && aiQuads.length > 0) {
+          const read = createRegionReader(frontImg);
+          frontQuads = aiQuads.map((q) => {
+            const localMatch = matchQuad(q, local.quads);
+            // AI boxes include a 1-2% safety margin, so search a little wider than usual
+            return localMatch ?? refineQuad(q, read, fw, fh, 0.06);
+          });
         }
-      } catch (e) {
-        console.warn('API detection network or parsing error, falling back to CV edge detector...', e);
       }
 
-      // Fallback to client-side Computer Vision detector if AI returned 0 cards
-      if (frontDetected.length === 0) {
-        const cvResults = await detectCardEdgesCV(frontScanUrl);
-        frontDetected = cvResults;
-      }
-
-      if (frontDetected.length === 0) {
+      if (frontQuads.length === 0) {
         setCropError('Could not detect distinct card edges in scan. Try adjusting brightness or use rigid template mode.');
-        setIsProcessingOcr(false);
         return;
       }
 
+      const frontDetected = sortReadingOrder(frontQuads).map((q, i) => quadToSlot(q, fw, fh, i, `Card ${i + 1}`));
       setSlots(frontDetected);
 
-      // 2. Handle Back Card Pairing & Normalization
+      // 3. Back: mirror front slots by flip mode, then snap to locally detected back cards (no API call).
+      //    backSlots[i] is always the back of slots[i].
       if (hasBackScan && backScanUrl) {
-        let backDetected: ScannerSlot[] = [];
-        try {
-          const optimizedBack = await createOptimizedScanForApi(backScanUrl, 1400, 0.82);
-
-          const backRes = await fetch('/api/detect-cards', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ imageBase64: optimizedBack }),
-          });
-
-          const backContentType = backRes.headers.get('content-type') || '';
-          if (!backRes.ok) {
-            const backErrText = await backRes.text();
-            console.warn(`Back card detection API status ${backRes.status}:`, backErrText.slice(0, 150));
-          } else if (backContentType.includes('application/json')) {
-            const backData = await backRes.json();
-            if (backData.detectedCards && backData.detectedCards.length > 0) {
-              backDetected = backData.detectedCards.map((c: any, idx: number) => {
-                const [ymin, xmin, ymax, xmax] = c.box_2d;
-                const isLandscape = c.isLandscape ?? (xmax - xmin > ymax - ymin);
-                return {
-                  id: idx,
-                  active: true,
-                  xPercent: Math.max(0, xmin / 10),
-                  yPercent: Math.max(0, ymin / 10),
-                  widthPercent: Math.min(100, (xmax - xmin) / 10),
-                  heightPercent: Math.min(100, (ymax - ymin) / 10),
-                  label: `Back Card ${idx + 1}`,
-                  rotation: c.orientation ?? (isLandscape ? 90 : 0),
-                  deskewAngle: c.deskewAngle ?? 0,
-                  isLandscape,
-                };
-              });
-            }
-          }
-        } catch (e) {
-          console.warn('Back detection request error:', e);
-        }
-
-        // If back detected cards match or fallback to mirrored front
-        if (backDetected.length >= frontDetected.length) {
-          // Sort or match back cards based on flipMode
-          setBackSlots(backDetected.slice(0, frontDetected.length));
-        } else {
-          // Mirrored mapping from front slots based on flipMode
-          const mirroredBack = frontDetected.map((s, idx) => {
-            let x = s.xPercent;
-            let y = s.yPercent;
-            if (flipMode === 'horizontal') {
-              x = Math.max(0, 100 - s.xPercent - s.widthPercent);
-            } else if (flipMode === 'vertical') {
-              y = Math.max(0, 100 - s.yPercent - s.heightPercent);
-            }
-            return {
-              ...s,
-              id: idx,
-              xPercent: x,
-              yPercent: y,
-              label: `Back Slot ${idx + 1}`,
-            };
-          });
-          setBackSlots(mirroredBack);
-        }
+        const backImg = await loadImage(backScanUrl);
+        const bw = backImg.naturalWidth, bh = backImg.naturalHeight;
+        const backLocal = detectCardsInElement(backImg, detectOptions);
+        const read = createRegionReader(backImg);
+        const backDetected = frontDetected.map((s, i) => {
+          const mirrored = mirrorSlot(s, flipMode);
+          const mirroredQuad = slotToQuad(mirrored, bw, bh);
+          const snapped = matchQuad(mirroredQuad, backLocal.quads) ?? refineQuad(mirroredQuad, read, bw, bh, 0.04);
+          return { ...quadToSlot(snapped, bw, bh, i, `Back Slot ${i + 1}`), rotation: s.rotation, isLandscape: s.isLandscape };
+        });
+        setBackSlots(backDetected);
       }
 
       setScanMode('auto-detect');
@@ -713,15 +695,20 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
         return;
       }
 
+      // Auto-detected back slots are already paired by index (backSlots[i] is the back of slots[i]),
+      // so skip grid flip mapping and keep only the backs of active fronts.
+      const isAutoPaired = scanMode === 'auto-detect';
+      const pairedBackSlots = isAutoPaired ? pairBackSlotsForActiveFronts(slots, backSlots) : backSlots;
+
       const cropped = await cropAllSlots(
         frontScanUrl,
         hasBackScan && backScanUrl ? backScanUrl : undefined,
         currentTemplate,
         activeSlots,
-        flipMode,
+        isAutoPaired ? 'direct' : flipMode,
         rotationAngle,
         skewAngle,
-        backSlots,
+        pairedBackSlots,
         backRotationAngle,
         backSkewAngle,
         edgeMarginPercent,
