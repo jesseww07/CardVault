@@ -431,7 +431,9 @@ export async function cropSlotFromImage(
   let cropW = Math.round((slot.widthPercent / 100) * sourceCanvas.width);
   let cropH = Math.round((slot.heightPercent / 100) * sourceCanvas.height);
 
-  const effectiveRotation = ((slot.rotation || 0) + (slotRotation || 0)) % 360;
+  // slotRotation is the complete orientation for this crop (callers pass slot.rotation or backRotation);
+  // adding slot.rotation again here used to turn landscape cards upside down.
+  const effectiveRotation = (((slotRotation || 0) % 360) + 360) % 360;
   const isSwap = Math.abs(effectiveRotation % 180) === 90;
 
   if (slotDeskew !== 0) {
@@ -528,6 +530,10 @@ export async function cropSlotFromImage(
   return targetCanvas.toDataURL('image/jpeg', 0.94);
 }
 
+/**
+ * Crops every active slot. `slots` must be the full slot list (inactive slots are skipped here) so that
+ * front indices line up with template back-slot mapping and with index-paired auto-detected back slots.
+ */
 export async function cropAllSlots(
   frontImageUrl: string,
   backImageUrl: string | undefined,
@@ -579,9 +585,7 @@ export async function cropAllSlots(
       try {
         mappedBackIdx = mapBackSlotIndex(i, template.rows, template.cols, flipMode);
         const targetBackSlot = (backSlots && backSlots[mappedBackIdx]) || (backSlots && backSlots[i]) || slots[mappedBackIdx] || slot;
-        const backRotation = targetBackSlot.backRotation !== undefined 
-          ? targetBackSlot.backRotation 
-          : (slot.rotation || 0);
+        const backRotation = targetBackSlot.backRotation ?? targetBackSlot.rotation ?? 0;
 
         backCropped = await cropSlotFromImage(
           backImg,

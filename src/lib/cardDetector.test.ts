@@ -1,15 +1,17 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  backRotationFor,
   CardQuad,
+  cropTouchesEdge,
   detectCardsInImage,
   matchQuad,
   mirrorSlot,
-  pairBackSlotsForActiveFronts,
   quadToSlot,
   refineQuad,
   RgbaImage,
   slotToQuad,
+  snapSlotsToQuads,
   sortReadingOrder,
 } from './cardDetector';
 import type { ScannerSlot } from '../types';
@@ -169,6 +171,31 @@ function assertCardsLocated(quads: CardQuad[], cards: SynthCard[]) {
   }
 }
 
+/**
+ * Looser check for cards separated from a neighbour: the tilt must be exact and the whole card inside the box,
+ * but the side facing the neighbour may keep some extra room.
+ */
+function assertCardsContained(quads: CardQuad[], cards: SynthCard[], maxSlack: number) {
+  assert.equal(quads.length, cards.length, 'card count');
+  for (const c of cards) {
+    const q = quads.find((q) => Math.hypot(q.cx - c.cx, q.cy - c.cy) < 60);
+    const label = `card at (${c.cx}, ${c.cy}, ${c.angle}°)`;
+    assert.ok(q, `${label} not detected`);
+    assert.ok(Math.abs(q.angleDeg - c.angle) < 0.2, `${label} angle ${q.angleDeg}`);
+    // Every true corner must lie inside the detected box
+    const r = (q.angleDeg * Math.PI) / 180;
+    for (const [du, dv] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+      const cr = (c.angle * Math.PI) / 180;
+      const x = c.cx + (du * c.w / 2) * Math.cos(cr) - (dv * c.h / 2) * Math.sin(cr);
+      const y = c.cy + (du * c.w / 2) * Math.sin(cr) + (dv * c.h / 2) * Math.cos(cr);
+      const u = (x - q.cx) * Math.cos(r) + (y - q.cy) * Math.sin(r);
+      const v = -(x - q.cx) * Math.sin(r) + (y - q.cy) * Math.cos(r);
+      assert.ok(Math.abs(u) <= q.width / 2 + 2 && Math.abs(v) <= q.height / 2 + 2, `${label} corner outside the box`);
+    }
+    assert.ok(q.width - c.w < maxSlack && q.height - c.h < maxSlack, `${label} box too roomy: ${q.width}x${q.height}`);
+  }
+}
+
 const gridOfCards = (angles: number[], w = 500, h = 700): SynthCard[] =>
   angles.map((angle, i) => ({
     cx: 330 + (i % 3) * 620,
@@ -227,6 +254,32 @@ describe('detectCardsInImage + refineQuad', () => {
     const res = detect(1700, 1400, LIGHT_LID, cards, { shadow: true, noise: 4 });
     assert.ok(res.confident);
     assertCardsLocated(res.quads, cards);
+  });
+
+  it('separates slabs placed close together when the lid shows between them', () => {
+    // The bevelled plastic edge of a slab scans as a dark rim
+    const slab = (cx: number, cy: number, angle: number): SynthCard => ({ cx, cy, w: 450, h: 725, angle, border: [160, 165, 170], art: [190, 40, 40] });
+    // Opposite tilts: the gap is ~30px at one end and nearly closed at the other; shadows join the regions
+    const cards = [slab(500, 450, -2.2), slab(485, 1200, 1.1), slab(1150, 470, 1.4), slab(1180, 1235, -1.2)];
+    const res = detect(1700, 1650, LIGHT_LID, cards, { shadow: true, noise: 5, expectedCount: 4 });
+    assert.ok(res.reasons.some((r) => r.startsWith('Separated')), `expected a separation, got ${res.reasons}`);
+    assert.ok(!res.quads.some((q) => q.approximate));
+    assert.ok(res.quads.every((q) => q.refined));
+    assertCardsContained(res.quads, cards, 50);
+  });
+
+  it('marks cards split without a visible gap as approximate and asks for a cross-check', () => {
+    // The bevelled plastic edge of a slab scans as a dark rim
+    const slab = (cx: number, cy: number, angle: number): SynthCard => ({ cx, cy, w: 450, h: 725, angle, border: [160, 165, 170], art: [190, 40, 40] });
+    // 5px gaps completely filled by shadow
+    const cards = [slab(500, 450, -2.2), slab(470, 1190, -1.1), slab(1150, 470, 1.4), slab(1160, 1200, 0.6)];
+    const res = detect(1700, 1650, LIGHT_LID, cards, { shadow: true, noise: 5, expectedCount: 4 });
+    assert.equal(res.quads.length, 4);
+    assert.ok(res.quads.every((q) => q.approximate && !q.refined));
+    assert.equal(res.confident, false);
+    for (const c of cards) assert.ok(res.quads.some((q) => Math.hypot(q.cx - c.cx, q.cy - c.cy) < 40), `no rough box near (${c.cx}, ${c.cy})`);
+    const slotted = snapSlotsToQuads([slot({ xPercent: 16, yPercent: 5, widthPercent: 26, heightPercent: 44 })], res.quads, 1700, 1650);
+    assert.equal(slotted.snapped, 0, 'approximate boxes are never used for snapping');
   });
 
   it('reports low confidence when two cards touch and merge', () => {
@@ -356,15 +409,85 @@ describe('sortReadingOrder', () => {
   });
 });
 
-describe('pairBackSlotsForActiveFronts', () => {
-  it('keeps backs aligned with active fronts when some slots are disabled', () => {
-    const fronts = [slot({ id: 0 }), slot({ id: 1, active: false }), slot({ id: 2 })];
-    const backs = [slot({ id: 10 }), slot({ id: 11 }), slot({ id: 12 })];
-    assert.deepEqual(pairBackSlotsForActiveFronts(fronts, backs).map((s) => s.id), [10, 12]);
+
+describe('backRotationFor', () => {
+  it('mirrors sideways cards for a book flip and keeps upright cards upright', () => {
+    assert.equal(backRotationFor(0, 'horizontal'), 0);
+    assert.equal(backRotationFor(90, 'horizontal'), 270);
+    assert.equal(backRotationFor(270, 'horizontal'), 90);
+    assert.equal(backRotationFor(180, 'horizontal'), 180);
   });
 
-  it('skips fronts that have no back slot', () => {
-    const fronts = [slot({ id: 0 }), slot({ id: 1 })];
-    assert.deepEqual(pairBackSlotsForActiveFronts(fronts, [slot({ id: 10 })]).map((s) => s.id), [10]);
+  it('turns upright cards upside down for a calendar flip', () => {
+    assert.equal(backRotationFor(0, 'vertical'), 180);
+    assert.equal(backRotationFor(90, 'vertical'), 90);
+    assert.equal(backRotationFor(180, 'vertical'), 0);
+  });
+
+  it('keeps rotation for direct pairing', () => {
+    assert.equal(backRotationFor(90, 'direct'), 90);
+  });
+});
+
+describe('snapSlotsToQuads', () => {
+  const W = 1000, H = 1000;
+  // Template expects cards at these positions; the real cards are shifted and tilted
+  const templateSlots = [
+    slot({ id: 0, label: 'Slot 1', xPercent: 10, yPercent: 10, widthPercent: 25, heightPercent: 35, rotation: 90 }),
+    slot({ id: 1, label: 'Slot 2', xPercent: 55, yPercent: 10, widthPercent: 25, heightPercent: 35 }),
+    slot({ id: 2, label: 'Slot 3', xPercent: 10, yPercent: 55, widthPercent: 25, heightPercent: 35, active: false }),
+  ];
+
+  it('moves active slots onto shifted, tilted cards and keeps slot identity and orientation', () => {
+    const shifted = quad({ cx: 250, cy: 290, width: 240, height: 340, angleDeg: 2 }); // template center (225, 275)
+    const res = snapSlotsToQuads(templateSlots, [shifted], W, H);
+    assert.equal(res.snapped, 1);
+    const s = res.slots[0];
+    assert.equal(s.label, 'Slot 1');
+    assert.equal(s.rotation, 90);
+    assert.equal(s.deskewAngle, -2);
+    assert.ok(Math.abs(s.xPercent - 13) < 1e-9 && Math.abs(s.yPercent - 12) < 1e-9);
+    assert.deepEqual(res.slots[1], templateSlots[1], 'slot without a detected card is unchanged');
+  });
+
+  it('ignores inactive slots, far-away cards and implausible sizes', () => {
+    const farAway = quad({ cx: 900, cy: 900, width: 250, height: 350 });
+    const tooSmall = quad({ cx: 675, cy: 275, width: 80, height: 110 });
+    const underInactive = quad({ cx: 225, cy: 725, width: 250, height: 350 });
+    const res = snapSlotsToQuads(templateSlots, [farAway, tooSmall, underInactive], W, H);
+    assert.equal(res.snapped, 0);
+    assert.deepEqual(res.slots, templateSlots);
+  });
+
+  it('never assigns one card to two slots', () => {
+    // Equidistant from both slot centers (325 and 445)
+    const between = quad({ cx: 385, cy: 275, width: 250, height: 350 });
+    const wide = [slot({ id: 0, xPercent: 20, yPercent: 10, widthPercent: 25, heightPercent: 35 }), slot({ id: 1, xPercent: 32, yPercent: 10, widthPercent: 25, heightPercent: 35 })];
+    assert.equal(snapSlotsToQuads(wide, [between], W, H).snapped, 1);
+  });
+});
+
+describe('cropTouchesEdge', () => {
+  const card = (cx: number, cy: number): SynthCard => ({ cx, cy, w: 300, h: 420, angle: 0, border: WHITE, art: [30, 60, 160] });
+
+  it('passes a crop with margin around the card', () => {
+    assert.equal(cropTouchesEdge(renderScan(340, 460, LIGHT_LID, [card(170, 230)], { noise: 4 })), false);
+  });
+
+  it('flags a crop where the card runs off one side', () => {
+    assert.equal(cropTouchesEdge(renderScan(340, 460, LIGHT_LID, [card(120, 230)], { noise: 4 })), true);
+  });
+
+  it('flags a white-bordered card clipped by only a few pixels', () => {
+    // Card right edge at 348 in a 340px-wide crop: only the white border reaches the crop edge
+    assert.equal(cropTouchesEdge(renderScan(340, 460, LIGHT_LID, [card(198, 230)], { noise: 4 })), true);
+  });
+
+  it('ignores a soft shadow in the margin', () => {
+    assert.equal(cropTouchesEdge(renderScan(340, 460, LIGHT_LID, [card(165, 225)], { noise: 4, shadow: true })), false);
+  });
+
+  it('flags a crop where the card runs off the bottom', () => {
+    assert.equal(cropTouchesEdge(renderScan(340, 460, LIGHT_LID, [card(170, 280)], { noise: 4 })), true);
   });
 });

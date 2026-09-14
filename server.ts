@@ -7,7 +7,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Set payload limits high for base64 scan images
 app.use(express.json({ limit: "60mb" }));
@@ -192,64 +192,95 @@ Sort all detected cards in standard reading order: top-to-bottom, then left-to-r
   }
 });
 
-// Endpoint: AI OCR & Structured Cataloging for cropped card (Front + optional Back)
+// Shared OCR extraction instructions and response schema for single-card and batch endpoints
+const CARD_EXTRACTION_INSTRUCTIONS = `
+Accuracy rules:
+- Only report what is visible. If a field cannot be read with confidence, return an empty string (or omit it). Never invent cert numbers, grades, years or sets.
+- If a "decoded barcode cert" is given for a card, it was read directly from the slab barcode and is authoritative: use it as certNumber.
+
+For each card extract:
+1. Card Identity:
+   - name: Player name, character name, or primary card title (e.g. "Michael Jordan", "Charizard", "Ken Griffey Jr.").
+   - year: Release or copyright year (e.g. "1986", "2023").
+   - set: Card set / product line (e.g. "Fleer", "Topps Chrome", "Panini Prizm", "Base Set 1st Edition").
+   - cardNumber: Card number with '#' prefix (e.g. "#57", "#4/102", "#US175").
+   - category: One of "Basketball", "Baseball", "Football", "Hockey", "Soccer", "Pokemon", "Magic: The Gathering", "Yu-Gi-Oh!", "Non-Sport / Marvel", "Other".
+   - variation: Parallel, insert, or variant details (e.g. "Rookie Card (RC)", "Refractor", "Silver Prizm", "Autograph", "Patch /99"). Empty if base.
+2. Grading Information:
+   - isGraded: true if encapsulated in a grading slab (PSA, BGS, CGC, SGC, TAG), false if raw card.
+   - gradingCompany: "PSA", "BGS", "CGC", "SGC", "TAG", or "Raw".
+   - grade: Grade exactly as printed on the label (e.g. "10", "9.5", "Authentic"). Empty if raw.
+   - certNumber: Certification / serial number printed on the slab label. Empty if raw.
+   - subgrades: Centering, Corners, Edges, Surface, Autograph if printed on the label (BGS/CGC).
+3. Condition & Value:
+   - estimatedCondition: For raw cards, assess visible corners/centering/surface (e.g. "Near Mint-Mint (NM-MT 8-9)"). Empty for slabs.
+   - estimatedValue: Conservative USD market estimate as a number, or omit if unsure.
+   - tags: Useful tags (e.g. ["RC", "HOF", "Vintage", "Holo", "PSA 10"]).
+   - frontOcrText: Key text printed on the front and slab label (up to 60 words).
+   - backOcrText: Key text printed on the back: stats line, serial numbering, copyright (up to 60 words).
+   - notes: Anything notable for a collector, brief.
+4. Orientation:
+   - frontRotation: Clockwise degrees (0, 90, 180 or 270) the FRONT image must be rotated so its text reads upright.
+   - backRotation: Same for the BACK image (0 if no back image).`;
+
+const CARD_RESPONSE_PROPERTIES = {
+  name: { type: Type.STRING },
+  year: { type: Type.STRING },
+  set: { type: Type.STRING },
+  cardNumber: { type: Type.STRING },
+  category: { type: Type.STRING },
+  variation: { type: Type.STRING },
+  isGraded: { type: Type.BOOLEAN },
+  gradingCompany: { type: Type.STRING },
+  grade: { type: Type.STRING },
+  certNumber: { type: Type.STRING },
+  subgrades: {
+    type: Type.OBJECT,
+    properties: {
+      centering: { type: Type.STRING },
+      corners: { type: Type.STRING },
+      edges: { type: Type.STRING },
+      surface: { type: Type.STRING },
+      auto: { type: Type.STRING },
+    },
+  },
+  estimatedCondition: { type: Type.STRING },
+  estimatedValue: { type: Type.NUMBER },
+  tags: { type: Type.ARRAY, items: { type: Type.STRING } },
+  frontOcrText: { type: Type.STRING },
+  backOcrText: { type: Type.STRING },
+  notes: { type: Type.STRING },
+  frontRotation: { type: Type.INTEGER },
+  backRotation: { type: Type.INTEGER },
+};
+
+const stripDataUrl = (b64: string) => b64.replace(/^data:image\/[a-z]+;base64,/, "");
+
+function cardHintLine(c: { barcodeCert?: string; barcodeCompany?: string }): string {
+  if (!c.barcodeCert) return "";
+  return `Decoded barcode cert: ${c.barcodeCert}${c.barcodeCompany ? ` (${c.barcodeCompany})` : ""}.\n`;
+}
+
+// Endpoint: AI OCR & Structured Cataloging for one cropped card (Front + optional Back)
 app.post("/api/ocr-card", async (req, res) => {
   try {
-    const { frontImageBase64, backImageBase64, templateHint, isSlabHint } = req.body;
+    const { frontImageBase64, backImageBase64, templateHint, isSlabHint, barcodeCert, barcodeCompany } = req.body;
     if (!frontImageBase64) {
       return res.status(400).json({ error: "frontImageBase64 is required" });
     }
 
     const ai = getGeminiClient();
-    const cleanFront = frontImageBase64.replace(/^data:image\/[a-z]+;base64,/, "");
-
-    const parts: any[] = [
-      {
-        inlineData: {
-          data: cleanFront,
-          mimeType: "image/jpeg",
-        },
-      },
-    ];
-
+    const parts: any[] = [{ inlineData: { data: stripDataUrl(frontImageBase64), mimeType: "image/jpeg" } }];
     if (backImageBase64) {
-      const cleanBack = backImageBase64.replace(/^data:image\/[a-z]+;base64,/, "");
-      parts.push({
-        inlineData: {
-          data: cleanBack,
-          mimeType: "image/jpeg",
-        },
-      });
+      parts.push({ inlineData: { data: stripDataUrl(backImageBase64), mimeType: "image/jpeg" } });
     }
 
-    const prompt = `You are an expert sports card and trading card game (TCG) authenticator, grader, and cataloger.
-Carefully examine the provided image(s) of this trading card.
-First image is the FRONT. If a second image is provided, it is the BACK of the same card.
-Template context hint: ${templateHint || "Standard Scan"}. Is slab hint: ${isSlabHint ? "Yes" : "Unknown"}.
-
-Extract all key metadata with high accuracy:
-1. Card Identity:
-   - name: Player name, character name, or primary card title (e.g. "Michael Jordan", "Charizard", "Ken Griffey Jr.", "Shohei Ohtani", "Pikachu", "Luffy", "Black Lotus").
-   - year: Release or copyright year (e.g. "1986", "1999", "2023", "1952").
-   - set: Card set / product line (e.g. "Fleer", "Base Set 1st Edition", "Topps Chrome", "Panini Prizm", "Upper Deck", "Bowman Chrome", "Scarlet & Violet").
-   - cardNumber: Card number with '#' prefix if appropriate (e.g. "#57", "#4/102", "#1", "#US175", "#NNO").
-   - category: One of "Basketball", "Baseball", "Football", "Hockey", "Soccer", "Pokemon", "Magic: The Gathering", "Yu-Gi-Oh!", "Non-Sport / Marvel", "Other".
-   - variation: Parallel, insert, or variant details (e.g. "Rookie Card (RC)", "Refractor", "Silver Prizm", "1st Edition Holo", "Base", "Shadowless", "Autograph", "Patch /99").
-
-2. Grading Information:
-   - isGraded: true if encapsulated in a grading slab (PSA, BGS, CGC, SGC, TAG, etc.), false if raw card.
-   - gradingCompany: "PSA", "BGS", "CGC", "SGC", "TAG", or "Raw".
-   - grade: Numeric or authentic grade from label (e.g. "10", "9.5", "9", "8.5", "Authentic", "Gem Mint 10").
-   - certNumber: Serial / certification number printed on the slab label (e.g. "84920194", "00129384"). Leave empty if raw.
-   - subgrades: Centering, Corners, Edges, Surface, Autograph grade if listed on BGS/CGC slab.
-
-3. Raw Condition & Value Estimation:
-   - estimatedCondition: If raw card, assess visible corners/centering/surface (e.g. "Gem Mint (GM 10)", "Near Mint-Mint (NM-MT 8-9)", "Near Mint (NM 7)", "Excellent (EX 5-6)", "Very Good (VG 3-4)", "Played/Poor").
-   - estimatedValue: Conservative realistic market value estimate in USD as a number (e.g. 25, 150, 2500).
-   - tags: Array of useful tags (e.g. ["RC", "HOF", "Vintage", "Holo", "PSA 10", "Graded"]).
-   - frontOcrText: Notable text strings transcribed from front.
-   - backOcrText: Notable text strings transcribed from back (stats, blurbs, serial numbers, copyright).`;
-
+    const prompt =
+      `You are an expert sports card and trading card game (TCG) authenticator, grader, and cataloger.\n` +
+      `The first image is the FRONT of one trading card. If a second image is provided, it is the BACK of the same card.\n` +
+      `Template context hint: ${templateHint || "Standard Scan"}. Is slab hint: ${isSlabHint ? "Yes" : "Unknown"}.\n` +
+      cardHintLine({ barcodeCert, barcodeCompany }) +
+      CARD_EXTRACTION_INSTRUCTIONS;
     parts.push({ text: prompt });
 
     const response = await generateWithFallback(ai, {
@@ -258,103 +289,45 @@ Extract all key metadata with high accuracy:
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
-          properties: {
-            name: { type: Type.STRING },
-            year: { type: Type.STRING },
-            set: { type: Type.STRING },
-            cardNumber: { type: Type.STRING },
-            category: { type: Type.STRING },
-            variation: { type: Type.STRING },
-            isGraded: { type: Type.BOOLEAN },
-            gradingCompany: { type: Type.STRING },
-            grade: { type: Type.STRING },
-            certNumber: { type: Type.STRING },
-            subgrades: {
-              type: Type.OBJECT,
-              properties: {
-                centering: { type: Type.STRING },
-                corners: { type: Type.STRING },
-                edges: { type: Type.STRING },
-                surface: { type: Type.STRING },
-                auto: { type: Type.STRING },
-              },
-            },
-            estimatedCondition: { type: Type.STRING },
-            estimatedValue: { type: Type.NUMBER },
-            tags: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-            },
-            frontOcrText: { type: Type.STRING },
-            backOcrText: { type: Type.STRING },
-            notes: { type: Type.STRING },
-          },
-          required: ["name", "year", "set", "cardNumber", "category", "isGraded", "gradingCompany"],
+          properties: CARD_RESPONSE_PROPERTIES,
+          required: ["name", "category", "isGraded", "gradingCompany"],
         },
       },
     });
 
-    const text = response?.text || "{}";
-    const parsed = JSON.parse(text);
-    return res.json(parsed);
+    return res.json(JSON.parse(response?.text || "{}"));
   } catch (error: any) {
     console.error("Card OCR extraction error:", error);
-    return res.status(500).json({
-      error: error.message || "Failed to process card OCR",
-    });
+    return res.status(502).json({ error: error.message || "Failed to process card OCR" });
   }
 });
 
-// Endpoint: Batch OCR
+// Endpoint: Batch OCR. The client sends small chunks; on failure it returns an error (never placeholder records)
 app.post("/api/ocr-batch", async (req, res) => {
-  try {
-    const { cards, templateHint, isSlabHint } = req.body;
-    if (!cards || !Array.isArray(cards) || cards.length === 0) {
-      return res.status(400).json({ error: "cards array is required" });
-    }
+  const { cards, templateHint, isSlabHint } = req.body;
+  if (!cards || !Array.isArray(cards) || cards.length === 0) {
+    return res.status(400).json({ error: "cards array is required" });
+  }
 
+  let text = "";
+  try {
     const ai = getGeminiClient();
     const parts: any[] = [];
 
     let prompt = `You are an expert sports card and trading card game (TCG) authenticator, grader, and cataloger.\n`;
-    prompt += `Carefully examine the provided images of ${cards.length} trading card(s).\n`;
-    prompt += `For each card, there is a FRONT image, and optionally a BACK image.\n`;
+    prompt += `The images below show ${cards.length} trading card(s), in order. For each card there is a FRONT image, then optionally its BACK image.\n`;
     prompt += `Template context hint: ${templateHint || "Standard Scan"}. Is slab hint: ${isSlabHint ? "Yes" : "Unknown"}.\n`;
 
     cards.forEach((c: any, index: number) => {
-      prompt += `\n--- Card ${index + 1} (ID: ${c.id}) ---\n`;
-      const cleanFront = c.frontImageBase64.replace(/^data:image\/[a-z]+;base64,/, "");
-      parts.push({ inlineData: { data: cleanFront, mimeType: "image/jpeg" } });
+      prompt += `\nCard ${index + 1} (ID: ${c.id}): ${c.backImageBase64 ? "front + back images" : "front image only"}.\n`;
+      prompt += cardHintLine(c);
+      parts.push({ inlineData: { data: stripDataUrl(c.frontImageBase64), mimeType: "image/jpeg" } });
       if (c.backImageBase64) {
-        const cleanBack = c.backImageBase64.replace(/^data:image\/[a-z]+;base64,/, "");
-        parts.push({ inlineData: { data: cleanBack, mimeType: "image/jpeg" } });
+        parts.push({ inlineData: { data: stripDataUrl(c.backImageBase64), mimeType: "image/jpeg" } });
       }
     });
 
-    prompt += `
-Extract all key metadata with high accuracy for EACH card and return an array of objects:
-1. Card Identity:
-   - name: Player name, character name, or primary card title.
-   - year: Release or copyright year.
-   - set: Card set / product line.
-   - cardNumber: Card number with '#' prefix if appropriate.
-   - category: One of "Basketball", "Baseball", "Football", "Hockey", "Soccer", "Pokemon", "Magic: The Gathering", "Yu-Gi-Oh!", "Non-Sport / Marvel", "Other".
-   - variation: Parallel, insert, or variant details.
-2. Grading Information:
-   - isGraded: true if encapsulated in a grading slab, false if raw card.
-   - gradingCompany: "PSA", "BGS", "CGC", "SGC", "TAG", or "Raw".
-   - grade: Numeric or authentic grade from label.
-   - certNumber: Serial / certification number printed on the slab label. Leave empty if raw.
-   - subgrades: Centering, Corners, Edges, Surface, Autograph grade if listed on BGS/CGC slab.
-3. Raw Condition & Value Estimation:
-   - estimatedCondition: If raw card, assess visible corners/centering/surface.
-   - estimatedValue: Conservative realistic market value estimate in USD as a number.
-   - tags: Array of useful tags.
-   - frontOcrText: KEEP THIS VERY SHORT. Max 20 words.
-   - backOcrText: KEEP THIS VERY SHORT. Max 20 words.
-   - notes: Keep brief.
-`;
-
+    prompt += `\nReturn one object per card, with "id" set to that card's ID.\n` + CARD_EXTRACTION_INSTRUCTIONS;
     parts.push({ text: prompt });
 
     const response = await generateWithFallback(ai, {
@@ -365,97 +338,21 @@ Extract all key metadata with high accuracy for EACH card and return an array of
           type: Type.ARRAY,
           items: {
             type: Type.OBJECT,
-            properties: {
-              id: { type: Type.STRING },
-              name: { type: Type.STRING },
-              year: { type: Type.STRING },
-              set: { type: Type.STRING },
-              cardNumber: { type: Type.STRING },
-              category: { type: Type.STRING },
-              variation: { type: Type.STRING },
-              isGraded: { type: Type.BOOLEAN },
-              gradingCompany: { type: Type.STRING },
-              grade: { type: Type.STRING },
-              certNumber: { type: Type.STRING },
-              subgrades: {
-                type: Type.OBJECT,
-                properties: {
-                  centering: { type: Type.STRING },
-                  corners: { type: Type.STRING },
-                  edges: { type: Type.STRING },
-                  surface: { type: Type.STRING },
-                  auto: { type: Type.STRING },
-                },
-              },
-              estimatedCondition: { type: Type.STRING },
-              estimatedValue: { type: Type.NUMBER },
-              tags: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
-              frontOcrText: { type: Type.STRING },
-              backOcrText: { type: Type.STRING },
-              notes: { type: Type.STRING },
-            },
-            required: ["id", "name", "year", "set", "cardNumber", "category", "isGraded", "gradingCompany"],
+            properties: { id: { type: Type.STRING }, ...CARD_RESPONSE_PROPERTIES },
+            required: ["id", "name", "category", "isGraded", "gradingCompany"],
           },
         },
       },
     });
 
-    const text = response?.text || "[]";
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch (parseError) {
-      console.warn("JSON Parse failed for batch OCR, attempting basic truncation repair...");
-      let repaired = text;
-      const lastQuote = repaired.lastIndexOf('"');
-      if (lastQuote > repaired.length - 20) {
-        repaired = repaired.substring(0, lastQuote) + '"} ]';
-      } else {
-        repaired = repaired + '} ]';
-      }
-      try {
-        parsed = JSON.parse(repaired);
-      } catch (e2) {
-        console.warn("Repair failed, returning fallback card items");
-        parsed = cards.map((c: any, i: number) => ({
-          id: String(i),
-          name: `Card ${i + 1}`,
-          year: "2024",
-          set: "Standard",
-          cardNumber: `#${i + 1}`,
-          category: "Other",
-          isGraded: Boolean(isSlabHint),
-          gradingCompany: isSlabHint ? "PSA" : "Raw",
-          grade: isSlabHint ? "10" : "",
-          estimatedCondition: isSlabHint ? "Gem Mint" : "Near Mint",
-          estimatedValue: 15,
-        }));
-      }
-    }
+    text = response?.text || "[]";
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) throw new Error("OCR response was not a list of cards");
     return res.json(parsed);
   } catch (error: any) {
-    console.error("Batch OCR error:", error);
-    // If all models fail, return default catalog items so the user isn't hard-blocked
-    const fallbackCards = (req.body.cards || []).map((c: any, i: number) => ({
-      id: String(i),
-      name: `Card ${i + 1}`,
-      year: "",
-      set: "",
-      cardNumber: `#${i + 1}`,
-      category: "Other",
-      variation: "Base",
-      isGraded: Boolean(req.body.isSlabHint),
-      gradingCompany: req.body.isSlabHint ? "PSA" : "Raw",
-      grade: req.body.isSlabHint ? "10" : "",
-      estimatedCondition: req.body.isSlabHint ? "Gem Mint" : "Near Mint",
-      estimatedValue: 15,
-      tags: ["Scanned"],
-      notes: "Auto-generated fallback record. Please review details.",
-    }));
-    return res.json(fallbackCards);
+    console.error("Batch OCR error:", error, text ? `Response text (first 300 chars): ${text.slice(0, 300)}` : "");
+    const message = error instanceof SyntaxError ? "OCR response was incomplete or malformed" : error.message;
+    return res.status(502).json({ error: message || "Batch OCR failed" });
   }
 });
 

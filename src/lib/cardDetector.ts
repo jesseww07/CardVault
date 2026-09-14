@@ -26,6 +26,8 @@ export interface CardQuad {
   rectangularity: number;
   aspectScore: number;
   refined: boolean;
+  /** Rough position only (touching cards split without a visible gap); not precise enough to crop or snap to. */
+  approximate?: boolean;
 }
 
 export interface DetectOptions {
@@ -211,6 +213,218 @@ function aspectScoreFor(width: number, height: number, hint?: number): number {
   return Math.max(0, 1 - err / 0.08);
 }
 
+interface Component {
+  label: number;
+  area: number;
+  boundary: Pt[];
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/** Labels 4-connected foreground regions of at least minArea pixels. labels receives the label of every pixel. */
+function findComponents(mask: Uint8Array, w: number, h: number, minArea: number, labels = new Int32Array(w * h)): Component[] {
+  const stack = new Int32Array(w * h);
+  const out: Component[] = [];
+  let nextLabel = 1;
+  for (let start = 0; start < w * h; start++) {
+    if (!mask[start] || labels[start]) continue;
+    const label = nextLabel++;
+    let sp = 0;
+    stack[sp++] = start;
+    labels[start] = label;
+    let area = 0;
+    let x0 = w, y0 = h, x1 = 0, y1 = 0;
+    const boundary: Pt[] = [];
+    while (sp > 0) {
+      const i = stack[--sp];
+      area++;
+      const x = i % w;
+      const y = (i - x) / w;
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+      let edge = false;
+      const visit = (j: number) => {
+        if (!mask[j]) edge = true;
+        else if (!labels[j]) {
+          labels[j] = label;
+          stack[sp++] = j;
+        }
+      };
+      if (x > 0) visit(i - 1); else edge = true;
+      if (x < w - 1) visit(i + 1); else edge = true;
+      if (y > 0) visit(i - w); else edge = true;
+      if (y < h - 1) visit(i + w); else edge = true;
+      if (edge) boundary.push({ x: x + 0.5, y: y + 0.5 });
+    }
+    if (area >= minArea) out.push({ label, area, boundary, x0, y0, x1, y1 });
+  }
+  return out;
+}
+
+interface RegionShape {
+  cx: number;
+  cy: number;
+  width: number;
+  height: number;
+  angleDeg: number;
+  rectangularity: number;
+  aspectScore: number;
+}
+
+function measureShape(boundary: Pt[], area: number, aspectHint?: number): RegionShape {
+  const rect = minAreaRect(convexHull(boundary));
+  return {
+    ...rect,
+    rectangularity: area / Math.max(1, rect.width * rect.height),
+    aspectScore: aspectScoreFor(rect.width, rect.height, aspectHint),
+  };
+}
+
+const isCardShape = (s: RegionShape) => s.rectangularity >= 0.8 && s.aspectScore > 0;
+
+/**
+ * Cards placed close together get joined by shadows or a thin bridge. Erode the region with growing radius
+ * until it falls apart into card-shaped pieces, then grow each piece back by the erosion radius.
+ */
+function splitTouchingCards(comp: Component, labels: Int32Array, w: number, minArea: number, aspectHint?: number): RegionShape[] | null {
+  const bw = comp.x1 - comp.x0 + 1;
+  const bh = comp.y1 - comp.y0 + 1;
+  for (const r of [2, 3, 5, 7, 10, 14]) {
+    const pad = r + 1;
+    const pw = bw + pad * 2, ph = bh + pad * 2;
+    const sub = new Uint8Array(pw * ph);
+    for (let y = 0; y < bh; y++) {
+      for (let x = 0; x < bw; x++) {
+        if (labels[(comp.y0 + y) * w + comp.x0 + x] === comp.label) sub[(y + pad) * pw + x + pad] = 1;
+      }
+    }
+    const pieces = findComponents(morph(sub, pw, ph, r, false), pw, ph, minArea * 0.35);
+    if (pieces.length < 2) continue;
+    const shapes = pieces.map((piece) => {
+      const shape = measureShape(piece.boundary, piece.area, aspectHint);
+      const width = shape.width + 2 * r, height = shape.height + 2 * r;
+      return {
+        ...shape,
+        cx: shape.cx + comp.x0 - pad,
+        cy: shape.cy + comp.y0 - pad,
+        width,
+        height,
+        aspectScore: aspectScoreFor(width, height, aspectHint),
+      };
+    });
+    if (shapes.every(isCardShape)) return shapes;
+  }
+  return null;
+}
+
+/**
+ * For cards that actually touch (hole filling has sealed the gap), cut the region across its length at the
+ * line where the unfilled mask shows the most background, trying piece counts implied by card proportions.
+ * When shadows hide the gap entirely, cut at the proportional position instead and report it as a blind cut:
+ * the count is usually right but the boxes are rough, so callers treat them as approximate.
+ */
+function cutTouchingCards(
+  comp: Component,
+  labels: Int32Array,
+  rawMask: Uint8Array,
+  w: number,
+  minArea: number,
+  aspectHint?: number
+): { shapes: RegionShape[]; blind: boolean } | null {
+  const region = measureShape(comp.boundary, comp.area, aspectHint);
+  const long = Math.max(region.width, region.height);
+  const short = Math.min(region.width, region.height);
+  const rad = (region.angleDeg * Math.PI) / 180;
+  // Unit vector along the region's long side
+  const [ax, ay] = region.width >= region.height ? [Math.cos(rad), Math.sin(rad)] : [-Math.sin(rad), Math.cos(rad)];
+
+  const bw = comp.x1 - comp.x0 + 1, bh = comp.y1 - comp.y0 + 1;
+  const pos = new Float32Array(bw * bh).fill(NaN); // position along the long axis, NaN outside the region
+  const bins = Math.ceil(long) + 3;
+  const inside = new Uint32Array(bins), background = new Uint32Array(bins);
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const i = (comp.y0 + y) * w + comp.x0 + x;
+      if (labels[i] !== comp.label) continue;
+      const t = (x + comp.x0 + 0.5 - region.cx) * ax + (y + comp.y0 + 0.5 - region.cy) * ay + long / 2;
+      pos[y * bw + x] = t;
+      const b = Math.min(bins - 1, Math.max(0, Math.round(t)));
+      inside[b]++;
+      if (!rawMask[i]) background[b]++;
+    }
+  }
+
+  const aspect = Math.min(aspectHint ?? 0.66, 1 / (aspectHint ?? 0.66));
+  const counts = new Set([Math.round((long * aspect) / short), Math.round(long / (short * aspect))]);
+  for (const n of counts) {
+    if (n < 2 || n > 6) continue;
+    const cuts: number[] = [];
+    let blind = false;
+    for (let k = 1; k < n; k++) {
+      const center = (k * long) / n, window = long / n / 4;
+      let best = -1, bestScore = 0;
+      for (let b = Math.max(1, Math.floor(center - window)); b <= Math.min(bins - 2, Math.ceil(center + window)); b++) {
+        const score = background[b] / Math.max(1, inside[b]);
+        if (score > bestScore) {
+          bestScore = score;
+          best = b;
+        }
+      }
+      if (best < 0 || bestScore < 0.03) {
+        blind = true;
+        best = Math.round(center);
+      }
+      cuts.push(best);
+    }
+
+    // Pixels right next to a cut may belong to the neighbour (its tilted corner), which skews the fitted angle.
+    // Measure each piece without that band, then extend the box back to the cut.
+    const band = Math.max(3, Math.round(long * 0.03));
+    const nearCut = (t: number) => cuts.some((c) => Math.abs(t - c) < band);
+    const pieceOf = (t: number) => (nearCut(t) ? -1 : cuts.filter((c) => t >= c).length);
+    const shapes: RegionShape[] = [];
+    for (let piece = 0; piece < n; piece++) {
+      const boundary: Pt[] = [];
+      let area = 0;
+      for (let y = 0; y < bh; y++) {
+        for (let x = 0; x < bw; x++) {
+          const t = pos[y * bw + x];
+          if (Number.isNaN(t) || pieceOf(t) !== piece) continue;
+          area++;
+          const same = (xx: number, yy: number) => {
+            if (xx < 0 || yy < 0 || xx >= bw || yy >= bh) return false;
+            const tt = pos[yy * bw + xx];
+            return !Number.isNaN(tt) && pieceOf(tt) === piece;
+          };
+          if (!same(x - 1, y) || !same(x + 1, y) || !same(x, y - 1) || !same(x, y + 1)) {
+            boundary.push({ x: x + comp.x0 + 0.5, y: y + comp.y0 + 0.5 });
+          }
+        }
+      }
+      if (area < minArea * 0.35) break;
+      const shape = measureShape(boundary, area, aspectHint);
+      // Grow along the region's long axis by the trimmed band on each side that has a cut
+      const alongWidth = Math.abs(Math.cos(((shape.angleDeg - region.angleDeg) * Math.PI) / 180)) > 0.7 === region.width >= region.height;
+      let { cx, cy, width, height } = shape;
+      for (const [cut, direction] of [[cuts[piece - 1], -1], [cuts[piece], 1]] as const) {
+        if (cut === undefined) continue;
+        if (alongWidth) width += band;
+        else height += band;
+        cx += (ax * direction * band) / 2;
+        cy += (ay * direction * band) / 2;
+      }
+      shapes.push({ ...shape, cx, cy, width, height, rectangularity: area / Math.max(1, shape.width * shape.height), aspectScore: aspectScoreFor(width, height, aspectHint) });
+    }
+    // The cut leaves a sliver of the neighbour on each piece, so allow slightly lower rectangularity
+    if (shapes.length === n && shapes.every((sh) => sh.rectangularity >= 0.75 && sh.aspectScore > 0)) return { shapes, blind };
+  }
+  return null;
+}
+
 export function detectCardsInImage(
   src: RgbaImage,
   sourceWidth: number,
@@ -279,6 +493,9 @@ export function detectCardsInImage(
   let mask = new Uint8Array(N);
   for (let i = 0; i < N; i++) mask[i] = dist[i] > distThreshold || grad[i] > gradThreshold ? 1 : 0;
 
+  // Keep the unfilled mask: gaps between touching cards still show background here
+  const rawMask = mask.slice();
+
   // Close gaps in outlines, fill interiors, remove specks
   const closeR = Math.max(2, Math.round(Math.min(w, h) * 0.004));
   mask = morph(morph(mask, w, h, closeR, true), w, h, closeR, false);
@@ -286,77 +503,60 @@ export function detectCardsInImage(
   mask = morph(morph(mask, w, h, 1, false), w, h, 1, true);
 
   // Connected components (4-connectivity)
-  const labels = new Int32Array(N);
-  const stack = new Int32Array(N);
   const imageArea = N;
   const minArea = imageArea * 0.012;
   const quads: CardQuad[] = [];
   let suspicious = 0;
-  let nextLabel = 1;
+  let separated = 0;
+  let blindCuts = 0;
+  const labels = new Int32Array(N);
 
-  for (let start = 0; start < N; start++) {
-    if (!mask[start] || labels[start]) continue;
-    const label = nextLabel++;
-    let sp = 0;
-    stack[sp++] = start;
-    labels[start] = label;
-    let area = 0;
-    const boundary: Pt[] = [];
-    while (sp > 0) {
-      const i = stack[--sp];
-      area++;
-      const x = i % w;
-      const y = (i - x) / w;
-      let edge = false;
-      const visit = (j: number) => {
-        if (!mask[j]) {
-          edge = true;
-        } else if (!labels[j]) {
-          labels[j] = label;
-          stack[sp++] = j;
-        }
-      };
-      if (x > 0) visit(i - 1); else edge = true;
-      if (x < w - 1) visit(i + 1); else edge = true;
-      if (y > 0) visit(i - w); else edge = true;
-      if (y < h - 1) visit(i + w); else edge = true;
-      if (edge) boundary.push({ x: x + 0.5, y: y + 0.5 });
-    }
+  const toQuad = (shape: RegionShape, approximate = false): CardQuad => ({
+    cx: shape.cx * scale,
+    cy: shape.cy * scale,
+    width: shape.width * scale,
+    height: shape.height * scale,
+    angleDeg: shape.angleDeg,
+    rectangularity: shape.rectangularity,
+    aspectScore: shape.aspectScore,
+    refined: false,
+    ...(approximate ? { approximate } : {}),
+  });
 
-    if (area < minArea) continue;
-    if (area > imageArea * 0.85) {
+  for (const comp of findComponents(mask, w, h, minArea, labels)) {
+    if (comp.area > imageArea * 0.85) {
       suspicious++;
       reasons.push('A region covers most of the scan (lid open or dark background?)');
       continue;
     }
 
-    const rect = minAreaRect(convexHull(boundary));
-    const rectangularity = area / Math.max(1, rect.width * rect.height);
-    const aspectScore = aspectScoreFor(rect.width, rect.height, options.aspectRatio);
-
-    if (rectangularity < 0.8 || aspectScore === 0) {
-      suspicious++;
-      reasons.push(
-        `Rejected non-card region (rectangularity ${rectangularity.toFixed(2)}, aspect ${(
-          Math.min(rect.width, rect.height) / Math.max(rect.width, rect.height)
-        ).toFixed(2)}) — cards may be touching`
-      );
+    const shape = measureShape(comp.boundary, comp.area, options.aspectRatio);
+    if (isCardShape(shape)) {
+      quads.push(toQuad(shape));
       continue;
     }
 
-    quads.push({
-      cx: rect.cx * scale,
-      cy: rect.cy * scale,
-      width: rect.width * scale,
-      height: rect.height * scale,
-      angleDeg: rect.angleDeg,
-      rectangularity,
-      aspectScore,
-      refined: false,
-    });
-  }
+    const eroded = splitTouchingCards(comp, labels, w, minArea, options.aspectRatio);
+    const cut = eroded ? null : cutTouchingCards(comp, labels, rawMask, w, minArea, options.aspectRatio);
+    const pieces = eroded ?? cut?.shapes;
+    if (pieces) {
+      quads.push(...pieces.map((piece) => toQuad(piece, Boolean(cut?.blind))));
+      separated += pieces.length;
+      if (cut?.blind) blindCuts++;
+      continue;
+    }
 
-  return scoreDetection(sortReadingOrder(quads), suspicious, reasons, sourceWidth, sourceHeight, options);
+    suspicious++;
+    reasons.push(
+      `Rejected non-card region (rectangularity ${shape.rectangularity.toFixed(2)}, aspect ${(
+        Math.min(shape.width, shape.height) / Math.max(shape.width, shape.height)
+      ).toFixed(2)}) — cards may be touching`
+    );
+  }
+  if (separated > 0) reasons.push(`Separated ${separated} cards that were touching or joined by shadows`);
+  if (blindCuts > 0) reasons.push(`${blindCuts} touching group(s) split by card proportions because no gap was visible`);
+
+  return scoreDetection(sortReadingOrder(quads), suspicious, reasons, sourceWidth, sourceHeight, options, separated, blindCuts);
 }
 
 function scoreDetection(
@@ -365,7 +565,9 @@ function scoreDetection(
   reasons: string[],
   sourceWidth: number,
   sourceHeight: number,
-  options: DetectOptions
+  options: DetectOptions,
+  separated = 0,
+  blindCuts = 0
 ): DetectionResult {
   let confidence = 0;
   if (quads.length === 0) {
@@ -376,6 +578,10 @@ function scoreDetection(
       quads.length;
     confidence = shape;
     if (suspicious > 0) confidence *= 0.5;
+    // Separated cards are usually right, but a quick AI cross-check is cheap insurance when many were split
+    if (separated > 2) confidence *= 0.9;
+    // Positions from blind cuts are rough; let the AI cross-check (auto-detect) before cropping
+    if (blindCuts > 0) confidence *= 0.6;
 
     // Cards on a single scan should be roughly the same size
     const areas = quads.map((q) => q.width * q.height).sort((a, b) => a - b);
@@ -419,10 +625,15 @@ export function sortReadingOrder(quads: CardQuad[]): CardQuad[] {
 
 /**
  * Snaps each side of a quad to the strongest nearby edge at source resolution and refits the rectangle.
- * searchFraction is the probe distance (inward and outward) as a fraction of the shorter side.
+ * searchFraction is the inward probe distance as a fraction of the shorter side. Boxes from the mask or the AI
+ * are almost always too large (shadow, safety margin, a neighbour's sliver), so the outward probe is shorter;
+ * this also keeps the probe from reaching into an adjacent card.
  */
 export function refineQuad(quad: CardQuad, read: RegionReader, sourceWidth: number, sourceHeight: number, searchFraction = 0.05): CardQuad {
-  const search = Math.max(4, Math.round(Math.min(quad.width, quad.height) * searchFraction));
+  if (quad.approximate) return quad;
+  const inward = Math.max(4, Math.round(Math.min(quad.width, quad.height) * Math.max(searchFraction, 0.08)));
+  const outward = Math.max(3, Math.round(Math.min(quad.width, quad.height) * Math.min(searchFraction, 0.015)));
+  const search = Math.max(inward, outward);
   const rad = (quad.angleDeg * Math.PI) / 180;
   const ux = Math.cos(rad), uy = Math.sin(rad); // card +x axis
   const vx = -uy, vy = ux; // card +y axis
@@ -468,7 +679,7 @@ export function refineQuad(quad: CardQuad, read: RegionReader, sourceWidth: numb
       const by = quad.cy + s.ny * s.off + s.ty * t;
       // Walk from outside inward; gradient = |I(d+1) - I(d-1)|
       const profile: number[] = [];
-      for (let d = search + 1; d >= -search - 1; d--) {
+      for (let d = outward + 1; d >= -inward - 1; d--) {
         // Average across a few pixels along the side to suppress scanner/JPEG noise
         let sum = 0;
         for (let e = -2; e <= 2; e++) sum += sample(bx + s.nx * d + s.tx * e, by + s.ny * d + s.ty * e);
@@ -487,7 +698,7 @@ export function refineQuad(quad: CardQuad, read: RegionReader, sourceWidth: numb
       const threshold = Math.max(12, gMax * 0.1);
       let j = g.findIndex((v) => v >= threshold);
       while (j + 1 < g.length && g[j + 1] > g[j]) j++;
-      const d = search - j; // outward offset from the current side
+      const d = outward - j; // outward offset from the current side
       ts.push(t);
       offs.push(d);
     }
@@ -515,6 +726,21 @@ export function refineQuad(quad: CardQuad, read: RegionReader, sourceWidth: numb
   });
 
   if (fitted.filter((f) => f.ok).length < 4) return quad;
+
+  // All four sides must agree on the card's tilt. With a slope b per side, the tilt implied is -b for top/right
+  // and +b for bottom/left. A side that disagrees has usually locked onto a neighbouring card or artwork:
+  // keep that side at its coarse position, tilted to match the others.
+  const tilts = fitted.map((f, i) => Math.atan(i < 2 ? -f.b : f.b));
+  const sortedTilts = tilts.slice().sort((x, y) => x - y);
+  const consensus = (sortedTilts[1] + sortedTilts[2]) / 2;
+  const tolerance = (0.6 * Math.PI) / 180;
+  const outliers = tilts.map((t) => Math.abs(t - consensus) > tolerance);
+  if (outliers.filter(Boolean).length > 1) return quad;
+  outliers.forEach((isOutlier, i) => {
+    if (!isOutlier) return;
+    const slope = Math.tan(consensus);
+    fitted[i] = { a: 0, b: i < 2 ? -slope : slope, ok: true };
+  });
 
   // Each side as a line: point P + tangent T, in source coordinates
   const lines = sides.map((s, i) => {
@@ -609,11 +835,78 @@ export function mirrorSlot(s: ScannerSlot, flipMode: string): ScannerSlot {
 }
 
 /**
- * Auto-detected back slots are paired by index (backSlots[i] is the back of frontSlots[i]).
- * Returns the backs of active fronts only, aligned with frontSlots.filter(s => s.active).
+ * Initial orientation guess for a card's back, given the front crop rotation and how the sheet was flipped.
+ * A book flip mirrors left/right (90 <-> 270); a calendar flip mirrors top/bottom (0 <-> 180).
  */
-export function pairBackSlotsForActiveFronts(frontSlots: ScannerSlot[], backSlots: ScannerSlot[]): ScannerSlot[] {
-  return frontSlots.flatMap((s, i) => (s.active && backSlots[i] ? [backSlots[i]] : []));
+export function backRotationFor(frontRotation: number, flipMode: string): number {
+  const r = (((frontRotation || 0) % 360) + 360) % 360;
+  if (flipMode === 'horizontal') return (360 - r) % 360;
+  if (flipMode === 'vertical') return (540 - r) % 360;
+  return r;
+}
+
+/**
+ * Moves template slots onto the cards actually found in the scan, so shifted or crooked placement
+ * still crops the whole card. Slots without a plausible match keep their template geometry.
+ */
+export function snapSlotsToQuads(
+  slots: ScannerSlot[],
+  quads: CardQuad[],
+  sourceWidth: number,
+  sourceHeight: number
+): { slots: ScannerSlot[]; snapped: number } {
+  const used = new Set<CardQuad>();
+  let snapped = 0;
+  const result = slots.map((slot) => {
+    if (!slot.active) return slot;
+    const target = slotToQuad(slot, sourceWidth, sourceHeight);
+    const match = matchQuad(target, quads.filter((q) => !used.has(q) && !q.approximate));
+    if (!match) return slot;
+    const areaRatio = (match.width * match.height) / Math.max(1, target.width * target.height);
+    if (areaRatio < 0.45 || areaRatio > 1.3) return slot;
+    used.add(match);
+    snapped++;
+    const geometry = quadToSlot(match, sourceWidth, sourceHeight, slot.id, slot.label || '');
+    return {
+      ...slot,
+      xPercent: geometry.xPercent,
+      yPercent: geometry.yPercent,
+      widthPercent: geometry.widthPercent,
+      heightPercent: geometry.heightPercent,
+      deskewAngle: geometry.deskewAngle,
+    };
+  });
+  return { slots: result, snapped };
+}
+
+/**
+ * Checks whether a card runs into the edge of its crop (so a border or corner may be cut off).
+ * The crop's outer ring should be plain matte/lid; a side where many pixels differ from that
+ * background means the card touches it.
+ */
+export function cropTouchesEdge(img: RgbaImage, ring = 2): boolean {
+  const { width: w, height: h, data } = img;
+  if (w < 20 || h < 20) return false;
+  const lum = (x: number, y: number) => {
+    const p = (y * w + x) * 4;
+    return 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
+  };
+  const sides: number[][] = [[], [], [], []];
+  for (let d = 0; d < ring; d++) {
+    for (let x = 0; x < w; x++) {
+      sides[0].push(lum(x, d));
+      sides[2].push(lum(x, h - 1 - d));
+    }
+    for (let y = 0; y < h; y++) {
+      sides[3].push(lum(d, y));
+      sides[1].push(lum(w - 1 - d, y));
+    }
+  }
+  const all = sides.flat().sort((a, b) => a - b);
+  const background = all[Math.floor(all.length / 2)];
+  // A card border is only ~20-30 levels brighter than a light lid, so the threshold is low;
+  // counting (rather than requiring one unbroken run) handles striped or busy artwork at the edge.
+  return sides.some((values) => values.filter((v) => Math.abs(v - background) > 20).length > values.length * 0.2);
 }
 
 /** Finds the detected quad whose center is nearest the slot's center, within half a card. */

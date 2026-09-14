@@ -22,7 +22,10 @@ import {
   Check,
   ChevronDown,
   Scan,
-  Loader2
+  Loader2,
+  Download,
+  FileArchive,
+  Barcode
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import {
@@ -31,8 +34,6 @@ import {
   FlipMode,
   CroppedSlotPair,
   CardRecord,
-  GradingBrand,
-  CardCategory
 } from '../types';
 import { DEFAULT_TEMPLATES, getTemplateSlots } from '../lib/defaultTemplates';
 import {
@@ -45,17 +46,24 @@ import {
   optimizeCroppedCardForOcr,
 } from '../lib/imageProcessor';
 import {
+  backRotationFor,
   CardQuad,
   createRegionReader,
+  cropTouchesEdge,
   detectCardsInElement,
   matchQuad,
   mirrorSlot,
-  pairBackSlotsForActiveFronts,
   quadToSlot,
   refineQuad,
   slotToQuad,
+  snapSlotsToQuads,
   sortReadingOrder,
 } from '../lib/cardDetector';
+import { getBarcodeReader } from '../lib/barcodeReader';
+import { certLookupUrl, readSlabBarcode } from '../lib/slabBarcode';
+import { buildCardRecord, chunk, createBatchId, OcrResult, resolveUprightRotations } from '../lib/ocrRecord';
+import { exportCardsToCsv, exportCardsToZip } from '../lib/csvExporter';
+import { dataUrlToBytes } from '../lib/zip';
 import { createPsaSlabDemoScan, createRaw9CardDemoScan, createRaw8LetterDemoScan, createLooseRaw8CardsDemoScan } from '../lib/sampleScans';
 import { AutoEdgeControls } from './AutoEdgeControls';
 import { InspectQualityModal } from './InspectQualityModal';
@@ -98,6 +106,105 @@ async function detectCardsWithApi(scanUrl: string, width: number, height: number
   }
 }
 
+/** Downscales a crop and checks whether the card runs into the crop border. */
+async function cropLooksClipped(dataUrl: string): Promise<boolean> {
+  const img = await loadImage(dataUrl);
+  const k = Math.min(1, 500 / Math.max(img.naturalWidth, img.naturalHeight));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(img.naturalWidth * k));
+  canvas.height = Math.max(1, Math.round(img.naturalHeight * k));
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return false;
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return cropTouchesEdge(ctx.getImageData(0, 0, canvas.width, canvas.height));
+}
+
+/** Runs local post-crop checks: slab barcode decoding and clipped-edge detection. Mutates the cards. */
+async function analyzeCrops(cards: CroppedSlotPair[], checkEdges: boolean): Promise<void> {
+  let read: Awaited<ReturnType<typeof getBarcodeReader>> | null = null;
+  try {
+    read = await getBarcodeReader();
+  } catch (e) {
+    console.warn('Barcode reader unavailable, continuing without barcodes:', e);
+  }
+  for (const card of cards) {
+    if (read) {
+      card.barcode = await readSlabBarcode(
+        read,
+        dataUrlToBytes(card.frontCroppedDataUrl),
+        card.backCroppedDataUrl ? dataUrlToBytes(card.backCroppedDataUrl) : undefined
+      );
+      // Label barcodes give exact orientation: turn those sides upright now, before OCR and export
+      if (card.barcode) {
+        const { front, back } = card.barcode.uprightRotation;
+        await applyUprightRotations(card, { front: front ?? 0, back: back ?? 0 });
+        card.barcode.uprightRotation = {
+          front: front === undefined ? undefined : 0,
+          back: back === undefined ? undefined : 0,
+        };
+      }
+    }
+    if (checkEdges) {
+      try {
+        card.edgeWarning = (await cropLooksClipped(card.frontCroppedDataUrl)) ||
+          (card.backCroppedDataUrl ? await cropLooksClipped(card.backCroppedDataUrl) : false);
+      } catch {
+        card.edgeWarning = false;
+      }
+    }
+  }
+}
+
+/** Rotates a card's crops so both sides read upright. */
+async function applyUprightRotations(card: CroppedSlotPair, rotation: { front: number; back: number }) {
+  if (rotation.front) card.frontCroppedDataUrl = await rotateImageDataUrl(card.frontCroppedDataUrl, rotation.front);
+  if (rotation.back && card.backCroppedDataUrl) {
+    card.backCroppedDataUrl = await rotateImageDataUrl(card.backCroppedDataUrl, rotation.back);
+  }
+}
+
+const OCR_CHUNK_SIZE = 4;
+
+/** Small status chips for local checks and review flags on a cropped card. */
+const CardCheckBadges: React.FC<{ card: CroppedSlotPair; showReasons?: boolean }> = ({ card, showReasons }) => {
+  const data = card.extractedData;
+  const hasBadges = card.barcode || card.edgeWarning || data?.needsReview;
+  if (!hasBadges) return null;
+  return (
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap gap-1 text-[10px] font-mono">
+        {card.barcode && (
+          <span
+            className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center gap-1"
+            title={`Decoded from ${card.barcode.side} barcode: ${card.barcode.rawText}`}
+          >
+            <Barcode className="w-3 h-3" />
+            {card.barcode.company ? `${card.barcode.company} ` : ''}#{card.barcode.certNumber}
+          </span>
+        )}
+        {card.edgeWarning && (
+          <span
+            className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30"
+            title="The card touches the crop border, so an edge or corner may be cut off. Re-align or increase the edge margin."
+          >
+            Edge may be clipped
+          </span>
+        )}
+        {data?.needsReview && (
+          <span className="px-1.5 py-0.5 rounded bg-red-500/15 text-red-300 border border-red-500/30">Needs review</span>
+        )}
+      </div>
+      {showReasons && data?.reviewReasons && data.reviewReasons.length > 0 && (
+        <ul className="text-[10px] text-red-200/80 font-mono list-disc pl-4 space-y-0.5">
+          {data.reviewReasons.map((r) => (
+            <li key={r}>{r}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+};
+
 interface ScannerStudioProps {
   templates: ScannerTemplate[];
   onBatchCatalogSaved: (cards: CardRecord[]) => void;
@@ -116,6 +223,16 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
   const [scanMode, setScanMode] = useState<'auto-detect' | 'template'>('auto-detect');
   const [edgeMarginPercent, setEdgeMarginPercent] = useState<number>(3); // 3% safety margin so all borders & corners are visible
   const [mattingBackground, setMattingBackground] = useState<'dark' | 'black' | 'white' | 'original'>('original');
+  const [snapToCardEdges, setSnapToCardEdges] = useState<boolean>(true);
+  const [batchId, setBatchId] = useState<string>('');
+  const [cropNotice, setCropNotice] = useState<string | null>(null);
+  const [exportZipOnSave, setExportZipOnSave] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('cardvault.exportZipOnSave') === '1';
+    } catch {
+      return false;
+    }
+  });
   const [inspectModal, setInspectModal] = useState<{
     isOpen: boolean;
     imageUrl: string;
@@ -603,7 +720,12 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
           const mirrored = mirrorSlot(s, flipMode);
           const mirroredQuad = slotToQuad(mirrored, bw, bh);
           const snapped = matchQuad(mirroredQuad, backLocal.quads) ?? refineQuad(mirroredQuad, read, bw, bh, 0.04);
-          return { ...quadToSlot(snapped, bw, bh, i, `Back Slot ${i + 1}`), rotation: s.rotation, isLandscape: s.isLandscape };
+          return {
+            ...quadToSlot(snapped, bw, bh, i, `Back Slot ${i + 1}`),
+            active: s.active,
+            rotation: backRotationFor(s.rotation || 0, flipMode),
+            isLandscape: s.isLandscape,
+          };
         });
         setBackSlots(backDetected);
       }
@@ -640,9 +762,9 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
       rotation: s.isLandscape ? 90 : 0,
     }));
     setSlots(updatedFront);
-    const updatedBack = backSlots.map((s) => ({
+    const updatedBack = backSlots.map((s, i) => ({
       ...s,
-      rotation: s.isLandscape ? 90 : 0,
+      rotation: backRotationFor(updatedFront[i]?.rotation ?? (s.isLandscape ? 90 : 0), flipMode),
     }));
     setBackSlots(updatedBack);
   };
@@ -680,35 +802,66 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
     }
   };
 
+  // Snap template slots onto the cards actually present, so shifted/crooked scans still crop whole cards
+  const snapTemplateSlots = async (): Promise<{ front: ScannerSlot[]; back: ScannerSlot[]; message: string | null }> => {
+    const detectOptions = { expectedCount: currentTemplate.rows * currentTemplate.cols, aspectRatio: currentTemplate.aspectRatio };
+    const snapOne = async (url: string, list: ScannerSlot[]) => {
+      const img = await loadImage(url);
+      const detection = detectCardsInElement(img, detectOptions);
+      return snapSlotsToQuads(list, detection.quads, img.naturalWidth, img.naturalHeight);
+    };
+
+    const front = await snapOne(frontScanUrl!, slots);
+    let back = { slots: backSlots, snapped: 0 };
+    if (hasBackScan && backScanUrl && backSlots.length > 0) back = await snapOne(backScanUrl, backSlots);
+
+    const activeCount = slots.filter((s) => s.active).length;
+    const parts = [`front ${front.snapped}/${activeCount}`];
+    if (hasBackScan && backScanUrl) parts.push(`back ${back.snapped}/${backSlots.filter((s) => s.active).length}`);
+    return {
+      front: front.slots,
+      back: back.slots,
+      message: `Snapped template slots to detected card edges (${parts.join(', ')}). Unmatched slots kept their template position.`,
+    };
+  };
+
   // Perform Batch Cropping and transition to OCR Step
   const handleExecuteBatchCrop = async () => {
     if (!frontScanUrl) return;
 
     try {
       setCropError(null);
+      setCropNotice(null);
       setIsProcessingOcr(true);
-      const activeSlots = slots.filter((s) => s.active);
 
-      if (activeSlots.length === 0) {
+      if (slots.filter((s) => s.active).length === 0) {
         setCropError('Please activate at least 1 slot before cropping.');
         setIsProcessingOcr(false);
         return;
       }
 
-      // Auto-detected back slots are already paired by index (backSlots[i] is the back of slots[i]),
-      // so skip grid flip mapping and keep only the backs of active fronts.
+      let cropSlots = slots;
+      let cropBackSlots = backSlots;
       const isAutoPaired = scanMode === 'auto-detect';
-      const pairedBackSlots = isAutoPaired ? pairBackSlotsForActiveFronts(slots, backSlots) : backSlots;
+      if (!isAutoPaired && snapToCardEdges) {
+        const snapped = await snapTemplateSlots();
+        cropSlots = snapped.front;
+        cropBackSlots = snapped.back;
+        setSlots(cropSlots);
+        setBackSlots(cropBackSlots);
+        setCropNotice(snapped.message);
+      }
 
+      // Auto-detected back slots are paired by index (backSlots[i] is the back of slots[i]), so no flip remapping.
       const cropped = await cropAllSlots(
         frontScanUrl,
         hasBackScan && backScanUrl ? backScanUrl : undefined,
         currentTemplate,
-        activeSlots,
+        cropSlots,
         isAutoPaired ? 'direct' : flipMode,
         rotationAngle,
         skewAngle,
-        pairedBackSlots,
+        cropBackSlots,
         backRotationAngle,
         backSkewAngle,
         edgeMarginPercent,
@@ -721,106 +874,101 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
         return;
       }
 
+      cropped.forEach((c) => (c.progressMessage = 'Reading slab barcodes...'));
       setCroppedCards(cropped);
+      setBatchId(createBatchId());
       setStep(3);
 
-      // Start automatic sequential OCR processing
+      await analyzeCrops(cropped, edgeMarginPercent > 0);
+      setCroppedCards([...cropped]);
+
       runBatchOcr(cropped);
     } catch (err: any) {
       console.error('Cropping error:', err);
       setCropError(err.message || 'Failed to crop cards from scan');
-    } finally {
       setIsProcessingOcr(false);
     }
   };
 
-    // Run AI OCR on all cropped cards using Batch endpoint
+  const recordContext = (now = Date.now()) => ({
+    batchId: batchId || createBatchId(),
+    now,
+    isSlabTemplate: currentTemplate.isSlab,
+    templateBrand: currentTemplate.brand,
+  });
+
+  const ocrPayload = async (c: CroppedSlotPair, id: string, maxDimension: number, quality: number) => ({
+    id,
+    frontImageBase64: await optimizeCroppedCardForOcr(c.frontCroppedDataUrl, maxDimension, quality),
+    backImageBase64: await optimizeCroppedCardForOcr(c.backCroppedDataUrl, maxDimension, quality),
+    barcodeCert: c.barcode?.certNumber,
+    barcodeCompany: c.barcode?.company,
+  });
+
+  const readErrorMessage = async (res: Response) => {
+    try {
+      if ((res.headers.get('content-type') || '').includes('application/json')) {
+        const errData = await res.json();
+        if (errData.error) return errData.error as string;
+      }
+    } catch {
+      // fall through
+    }
+    return `Server returned ${res.status}`;
+  };
+
+  /** Applies an OCR result to a card: fixes orientation, then builds its catalog record. */
+  const finishCard = async (card: CroppedSlotPair, ocr: OcrResult | undefined, now: number, error?: string) => {
+    if (ocr) await applyUprightRotations(card, resolveUprightRotations(card, ocr));
+    const previous = card.extractedData;
+    card.extractedData = {
+      ...buildCardRecord(card, ocr, { ...recordContext(now) }, error),
+      ...(previous?.id ? { id: previous.id, createdAt: previous.createdAt } : {}),
+    };
+    card.status = ocr ? 'done' : 'error';
+    card.error = ocr ? undefined : error || 'OCR returned no data for this card';
+    card.progressMessage = ocr ? 'Data Extracted' : 'Review required';
+  };
+
+  // Run AI OCR on all cropped cards, a few cards per request so one failure or truncated response doesn't sink the batch
   const runBatchOcr = async (cardsToProcess: CroppedSlotPair[]) => {
     setIsProcessingOcr(true);
     const updated = [...cardsToProcess];
-    
-    // Set all to processing
-    updated.forEach(card => {
+    const now = Date.now();
+
+    updated.forEach((card) => {
       card.status = 'processing';
-      card.progressMessage = 'Analyzing batch with Gemini OCR...';
+      card.progressMessage = 'Analyzing with Gemini OCR...';
     });
     setCroppedCards([...updated]);
 
-    try {
-      const payloadCards = await Promise.all(
-        updated.map(async (c, i) => ({
-          id: String(i),
-          frontImageBase64: await optimizeCroppedCardForOcr(c.frontCroppedDataUrl, 1000, 0.85),
-          backImageBase64: await optimizeCroppedCardForOcr(c.backCroppedDataUrl, 1000, 0.85),
-        }))
-      );
-
-      const res = await fetch('/api/ocr-batch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          cards: payloadCards,
-          templateHint: currentTemplate.name,
-          isSlabHint: currentTemplate.isSlab,
-        }),
-      });
-
-      if (!res.ok) {
-        let errorMsg = `Server returned ${res.status}`;
-        try {
-          const contentType = res.headers.get('content-type') || '';
-          if (contentType.includes('application/json')) {
-            const errData = await res.json();
-            if (errData.error) errorMsg = errData.error;
-          }
-        } catch (e) {}
-        throw new Error(errorMsg);
+    for (const group of chunk(updated, OCR_CHUNK_SIZE)) {
+      let results: OcrResult[] = [];
+      let error: string | undefined;
+      try {
+        const payloadCards = await Promise.all(group.map((c) => ocrPayload(c, String(c.slotIndex), 1000, 0.85)));
+        const res = await fetch('/api/ocr-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cards: payloadCards, templateHint: currentTemplate.name, isSlabHint: currentTemplate.isSlab }),
+        });
+        if (!res.ok) throw new Error(await readErrorMessage(res));
+        results = await res.json();
+      } catch (err: any) {
+        error = err.message || 'Batch OCR extraction failed';
       }
 
-      const batchData = await res.json();
-      
-      updated.forEach((card, i) => {
-        const data = batchData.find((d: any) => d.id === String(i)) || {};
-        card.status = 'done';
-        card.progressMessage = 'Data Extracted';
-        card.error = undefined;
-        card.extractedData = {
-          id: `card-${Date.now()}-${i}`,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          frontImage: card.frontCroppedDataUrl,
-          backImage: card.backCroppedDataUrl,
-          name: data.name || `Card ${i + 1}`,
-          year: data.year || '',
-          set: data.set || '',
-          cardNumber: data.cardNumber || '',
-          category: (data.category as CardCategory) || 'Other',
-          variation: data.variation || 'Base',
-          isGraded: Boolean(data.isGraded),
-          gradingCompany: (data.gradingCompany as GradingBrand) || (currentTemplate.isSlab ? currentTemplate.brand as GradingBrand : 'Raw'),
-          grade: data.grade || (data.isGraded ? '10' : ''),
-          certNumber: data.certNumber || '',
-          subgrades: data.subgrades,
-          estimatedCondition: data.estimatedCondition || (data.isGraded ? 'Graded' : 'Near Mint'),
-          estimatedValue: typeof data.estimatedValue === 'number' ? data.estimatedValue : 15,
-          currency: 'USD',
-          frontOcrText: data.frontOcrText || '',
-          backOcrText: data.backOcrText || '',
-          tags: Array.isArray(data.tags) ? data.tags : ['Cataloged'],
-          notes: data.notes || '',
-          slotIndex: card.slotIndex,
-        };
-      });
-    } catch (err: any) {
-      updated.forEach((card) => {
-        card.status = 'error';
-        card.error = err.message || 'Batch OCR extraction failed';
-      });
+      for (const card of group) {
+        const ocr = results.find((d) => d.id === String(card.slotIndex));
+        await finishCard(card, ocr, now, error);
+      }
+      setCroppedCards([...updated]);
     }
 
-    setCroppedCards([...updated]);
     setIsProcessingOcr(false);
-    confetti({ particleCount: 80, spread: 70, origin: { y: 0.6 } });
+    if (updated.some((c) => c.status === 'done')) {
+      confetti({ particleCount: 80, spread: 70, origin: { y: 0.6 } });
+    }
     setStep(4);
   };
 
@@ -833,42 +981,16 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
     setCroppedCards([...croppedCards]);
 
     try {
-      const frontOpt = await optimizeCroppedCardForOcr(card.frontCroppedDataUrl, 1100, 0.86);
-      const backOpt = await optimizeCroppedCardForOcr(card.backCroppedDataUrl, 1100, 0.86);
-
+      const { id: _id, ...payload } = await ocrPayload(card, '0', 1100, 0.86);
       const res = await fetch('/api/ocr-card', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          frontImageBase64: frontOpt,
-          backImageBase64: backOpt,
-          templateHint: currentTemplate.name,
-          isSlabHint: currentTemplate.isSlab,
-        }),
+        body: JSON.stringify({ ...payload, templateHint: currentTemplate.name, isSlabHint: currentTemplate.isSlab }),
       });
-      if (!res.ok) {
-        let errorMsg = `Server returned ${res.status}`;
-        try {
-          const contentType = res.headers.get('content-type') || '';
-          if (contentType.includes('application/json')) {
-            const errData = await res.json();
-            if (errData.error) errorMsg = errData.error;
-          }
-        } catch (e) {
-          // ignore error
-        }
-        throw new Error(errorMsg);
-      }
-      const data = await res.json();
-      card.status = 'done';
-      card.error = undefined;
-      card.extractedData = {
-        ...(card.extractedData || {}),
-        ...data,
-      };
+      if (!res.ok) throw new Error(await readErrorMessage(res));
+      await finishCard(card, await res.json(), Date.now());
     } catch (err: any) {
-      card.status = 'error';
-      card.error = err.message || 'OCR extraction failed';
+      await finishCard(card, undefined, Date.now(), err.message || 'OCR extraction failed');
     }
     setCroppedCards([...croppedCards]);
   };
@@ -876,17 +998,41 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
   // Update card field in review step
   const handleUpdateCardField = (index: number, field: string, value: any) => {
     const updated = [...croppedCards];
-    if (updated[index] && updated[index].extractedData) {
-      (updated[index].extractedData as any)[field] = value;
+    const data = updated[index]?.extractedData;
+    if (data) {
+      (data as any)[field] = value;
+      if (field === 'certNumber') data.certSource = value ? 'manual' : undefined;
+      if (field === 'certNumber' || field === 'gradingCompany') {
+        data.certLookupUrl = certLookupUrl(data.gradingCompany, data.certNumber || '');
+      }
       setCroppedCards(updated);
+    }
+  };
+
+  const batchRecords = (): CardRecord[] =>
+    croppedCards.filter((c) => c.extractedData).map((c) => c.extractedData as CardRecord);
+
+  const handleExportBatch = (format: 'csv' | 'zip') => {
+    const records = batchRecords();
+    if (records.length === 0) return;
+    const baseName = `cardvault-${batchId || createBatchId()}`;
+    if (format === 'csv') exportCardsToCsv(records, `${baseName}.csv`);
+    else exportCardsToZip(records, baseName);
+  };
+
+  const toggleExportOnSave = (value: boolean) => {
+    setExportZipOnSave(value);
+    try {
+      localStorage.setItem('cardvault.exportZipOnSave', value ? '1' : '0');
+    } catch {
+      // storage unavailable; preference lasts for this session only
     }
   };
 
   // Save all cataloged cards to collection database
   const handleSaveAllToDatabase = () => {
-    const validCards: CardRecord[] = croppedCards
-      .filter((c) => c.extractedData)
-      .map((c) => c.extractedData as CardRecord);
+    const validCards = batchRecords();
+    if (exportZipOnSave) handleExportBatch('zip');
 
     onBatchCatalogSaved(validCards);
     confetti({ particleCount: 120, spread: 80, origin: { y: 0.5 } });
@@ -1452,6 +1598,23 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
               </div>
             )}
 
+            {scanMode === 'template' && (
+              <label className="flex items-start space-x-2 p-3 bg-[#050505] border border-white/10 rounded-xl text-[11px] text-gray-300 cursor-pointer hover:border-cyan-500/40">
+                <input
+                  type="checkbox"
+                  checked={snapToCardEdges}
+                  onChange={(e) => setSnapToCardEdges(e.target.checked)}
+                  className="mt-0.5 accent-cyan-400"
+                />
+                <span>
+                  <span className="font-bold uppercase tracking-wider text-white">Snap slots to card edges</span>
+                  <span className="block text-gray-500 font-mono mt-0.5">
+                    Moves each slot onto the card actually in the scan and straightens tilted cards. Fixes shifted or crooked placement.
+                  </span>
+                </span>
+              </label>
+            )}
+
             {/* Execute Batch Crop Button */}
             <button
               id="btn-crop-all-cards"
@@ -1537,6 +1700,7 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
               <p className="text-xs text-gray-400 font-mono mt-1">
                 Cards normalized with safe edge borders and uniform orientation. Click any card to inspect quality.
               </p>
+              {cropNotice && <p className="text-[11px] text-cyan-300/80 font-mono mt-1">{cropNotice}</p>}
             </div>
             {!isProcessingOcr && (
               <button
@@ -1645,10 +1809,10 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
                 {/* Status Indicator */}
                 <div className="space-y-1">
                   <div className="flex items-center justify-between text-xs font-semibold">
-                    {card.status === 'processing' && (
+                    {(card.status === 'processing' || card.status === 'pending') && (
                       <span className="text-cyan-400 flex items-center space-x-1 font-mono text-[11px]">
                         <RefreshCw className="w-3 h-3 animate-spin" />
-                        <span>OCR running...</span>
+                        <span>{card.progressMessage || 'OCR running...'}</span>
                       </span>
                     )}
                     {card.status === 'done' && (
@@ -1670,6 +1834,7 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
                       {card.extractedData.name} ({card.extractedData.year || 'N/A'})
                     </div>
                   )}
+                  <CardCheckBadges card={card} />
                 </div>
               </div>
             ))}
@@ -1691,21 +1856,59 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
                 Uniformly oriented with full edges visible for quality inspection. Click "Inspect Quality" on any card to examine corners, borders, and centering.
               </p>
             </div>
-            <div className="flex items-center space-x-3">
-              <button
-                onClick={() => setStep(2)}
-                className="px-4 py-2 bg-[#050505] hover:bg-white/5 text-gray-300 rounded-xl text-xs font-mono font-bold uppercase tracking-wider border border-white/10"
-              >
-                Re-Align Crop
-              </button>
-              <button
-                id="btn-save-batch-db"
-                onClick={handleSaveAllToDatabase}
-                className="px-6 py-2.5 bg-cyan-500 hover:bg-cyan-400 text-black font-black uppercase tracking-wider rounded-xl text-xs shadow-[0_0_20px_rgba(6,182,212,0.4)] flex items-center space-x-2 transition-all active:scale-95"
-              >
-                <Check className="w-4 h-4" />
-                <span>Save All {croppedCards.length} Cards to Database</span>
-              </button>
+            <div className="flex flex-col items-stretch sm:items-end gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => setStep(2)}
+                  className="px-4 py-2 bg-[#050505] hover:bg-white/5 text-gray-300 rounded-xl text-xs font-mono font-bold uppercase tracking-wider border border-white/10"
+                >
+                  Re-Align Crop
+                </button>
+                <button
+                  id="btn-export-batch-csv"
+                  onClick={() => handleExportBatch('csv')}
+                  disabled={batchRecords().length === 0}
+                  className="px-3.5 py-2 bg-[#050505] hover:bg-cyan-500/15 border border-white/10 hover:border-cyan-500/40 text-cyan-300 rounded-xl text-xs font-bold uppercase tracking-wider flex items-center space-x-1.5 disabled:opacity-40"
+                  title="Download this batch as a CSV spreadsheet"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Batch CSV</span>
+                </button>
+                <button
+                  id="btn-export-batch-zip"
+                  onClick={() => handleExportBatch('zip')}
+                  disabled={batchRecords().length === 0}
+                  className="px-3.5 py-2 bg-[#050505] hover:bg-cyan-500/15 border border-white/10 hover:border-cyan-500/40 text-cyan-300 rounded-xl text-xs font-bold uppercase tracking-wider flex items-center space-x-1.5 disabled:opacity-40"
+                  title="Download one ZIP with the batch CSV and every front/back image"
+                >
+                  <FileArchive className="w-3.5 h-3.5" />
+                  <span>CSV + Images (ZIP)</span>
+                </button>
+                <button
+                  id="btn-save-batch-db"
+                  onClick={handleSaveAllToDatabase}
+                  className="px-6 py-2.5 bg-cyan-500 hover:bg-cyan-400 text-black font-black uppercase tracking-wider rounded-xl text-xs shadow-[0_0_20px_rgba(6,182,212,0.4)] flex items-center space-x-2 transition-all active:scale-95"
+                >
+                  <Check className="w-4 h-4" />
+                  <span>Save All {croppedCards.length} Cards to Database</span>
+                </button>
+              </div>
+              <label className="flex items-center space-x-2 text-[11px] text-gray-400 font-mono cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={exportZipOnSave}
+                  onChange={(e) => toggleExportOnSave(e.target.checked)}
+                  className="accent-cyan-400"
+                />
+                <span>Also download CSV + images (ZIP) when saving</span>
+              </label>
+              {croppedCards.some((c) => c.extractedData?.needsReview || c.edgeWarning) && (
+                <p className="text-[11px] text-amber-300/90 font-mono">
+                  {croppedCards.filter((c) => c.extractedData?.needsReview).length} need review ·{' '}
+                  {croppedCards.filter((c) => c.edgeWarning).length} possible clipped edges ·{' '}
+                  {croppedCards.filter((c) => c.barcode).length} slab barcodes read
+                </p>
+              )}
             </div>
           </div>
 
@@ -1794,6 +1997,8 @@ export const ScannerStudio: React.FC<ScannerStudioProps> = ({
                       )}
                     </div>
                   </div>
+
+                  <CardCheckBadges card={card} showReasons={!card.error} />
 
                   {card.error && (
                     <div className="p-3 bg-red-950/60 border border-red-500/50 rounded-xl text-xs text-red-200 flex items-start space-x-2">

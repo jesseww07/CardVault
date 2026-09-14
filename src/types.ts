@@ -36,6 +36,13 @@ export interface CardRecord {
   gradingCompany: GradingBrand;
   grade: string;
   certNumber?: string;
+  /** Where certNumber came from: decoded from the slab barcode/QR, read by OCR, or typed in. */
+  certSource?: 'barcode' | 'ocr' | 'manual';
+  /** Grader's public cert verification page, when the company is known. */
+  certLookupUrl?: string;
+  /** Set when extraction failed or looked unreliable, so the record is checked before being trusted. */
+  needsReview?: boolean;
+  reviewReasons?: string[];
   subgrades?: CardSubgrades;
   estimatedCondition?: string;
   estimatedValue?: number;
@@ -118,6 +125,23 @@ export interface CroppedSlotPair {
   progressMessage?: string;
   extractedData?: Partial<CardRecord>;
   error?: string;
+  /** Slab barcodes decoded locally from the front/back crops. */
+  barcode?: SlabBarcodeInfo;
+  /** Set when the card appears to touch the crop border (an edge may be cut off). */
+  edgeWarning?: boolean;
+}
+
+export interface SlabBarcodeInfo {
+  certNumber: string;
+  company?: GradingBrand;
+  lookupUrl?: string;
+  rawText: string;
+  side: 'front' | 'back';
+  /**
+   * Clockwise rotation that makes each side's crop upright, from the reading direction of any grading-label
+   * barcode found on that side. Undefined when that side had none; reset to 0 once applied.
+   */
+  uprightRotation: { front?: number; back?: number };
 }
 
 export interface ScanBatchSession {

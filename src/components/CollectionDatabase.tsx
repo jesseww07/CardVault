@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Search,
   Filter,
@@ -21,7 +21,7 @@ import {
   SlidersHorizontal
 } from 'lucide-react';
 import { CardRecord, CardCategory, GradingBrand, FilterOptions } from '../types';
-import { exportCardsToCsv, CsvExportSummary } from '../lib/csvExporter';
+import { exportCardsToCsv, exportCardsToZip, CsvExportSummary } from '../lib/csvExporter';
 import { ExportCsvModal } from './ExportCsvModal';
 
 interface CollectionDatabaseProps {
@@ -87,14 +87,6 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
     );
   };
 
-  const toggleSelectAll = () => {
-    if (selectedCardIds.length === filteredCards.length) {
-      setSelectedCardIds([]);
-    } else {
-      setSelectedCardIds(filteredCards.map((c) => c.id));
-    }
-  };
-
   // Filter and Sort Cards
   const filteredCards = useMemo(() => {
     return cards
@@ -140,6 +132,30 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
         return sortOrder === 'asc' ? comp : -comp;
       });
   }, [cards, searchQuery, categoryFilter, companyFilter, gradedFilter, sortBy, sortOrder]);
+
+  // Selection only ever covers cards currently shown, so bulk actions never touch hidden cards
+  useEffect(() => {
+    const visible = new Set(filteredCards.map((c) => c.id));
+    setSelectedCardIds((prev) => {
+      const next = prev.filter((id) => visible.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [filteredCards]);
+
+  const allVisibleSelected = filteredCards.length > 0 && selectedCardIds.length === filteredCards.length;
+  const someVisibleSelected = selectedCardIds.length > 0 && !allVisibleSelected;
+
+  const toggleSelectAll = () => {
+    setSelectedCardIds(allVisibleSelected ? [] : filteredCards.map((c) => c.id));
+  };
+
+  const selectAllRef = useRef<HTMLInputElement>(null);
+  const tableSelectAllRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    for (const el of [selectAllRef.current, tableSelectAllRef.current]) {
+      if (el) el.indeterminate = someVisibleSelected;
+    }
+  }, [someVisibleSelected, viewMode]);
 
   // Export to CSV Function
   const handleExportCsv = (scope?: 'all' | 'filtered' | 'selected' | 'prompt') => {
@@ -189,37 +205,17 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
     setTimeout(() => setToastMessage(null), 4000);
   };
 
-  // Download Images Batch
+  // Download CSV + front/back images as one ZIP (avoids one browser download per image)
   const handleDownloadImages = () => {
     const cardsToExport = selectedCardIds.length > 0
       ? cards.filter((c) => selectedCardIds.includes(c.id))
       : filteredCards;
-      
-    if (cardsToExport.length > 30 && !confirm(`You are about to download images for ${cardsToExport.length} cards (up to ${cardsToExport.length * 2} files). This may take a moment or trigger browser multiple download warnings. Proceed?`)) {
-      return;
-    }
+    if (cardsToExport.length === 0) return;
 
-    const downloadImage = (dataUrl, filename) => {
-      const link = document.createElement('a');
-      link.href = dataUrl;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-    };
-
-    let delayCounter = 0;
-    cardsToExport.forEach((c) => {
-      const safeName = (c.name || 'card').replace(/[^a-z0-9]/gi, '_').toLowerCase();
-      if (c.frontImage) {
-        setTimeout(() => downloadImage(c.frontImage, `${safeName}_${c.id.substring(0,4)}_front.jpg`), delayCounter * 300);
-        delayCounter++;
-      }
-      if (c.backImage) {
-        setTimeout(() => downloadImage(c.backImage, `${safeName}_${c.id.substring(0,4)}_back.jpg`), delayCounter * 300);
-        delayCounter++;
-      }
-    });
+    const scopeName = selectedCardIds.length > 0 ? 'selected' : 'filtered';
+    const summary = exportCardsToZip(cardsToExport, `cardvault-${scopeName}-${new Date().toISOString().slice(0, 10)}`);
+    setToastMessage(`✓ Downloaded ${summary.count} cards (CSV + images) as ${summary.filename}`);
+    setTimeout(() => setToastMessage(null), 4000);
   };
 
   // Export to JSON
@@ -442,6 +438,30 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
           </div>
         </div>
 
+        {/* Select All Bar */}
+        {filteredCards.length > 0 && (
+          <div className="flex flex-wrap items-center gap-3 pt-3 border-t border-white/10 text-xs font-mono">
+            <label className="flex items-center space-x-2 cursor-pointer text-gray-300 hover:text-white">
+              <input
+                id="select-all-cards-checkbox"
+                ref={selectAllRef}
+                type="checkbox"
+                checked={allVisibleSelected}
+                onChange={toggleSelectAll}
+                className="w-4 h-4 rounded border-white/20 bg-black accent-cyan-400"
+              />
+              <span className="font-bold uppercase tracking-wider text-[11px]">
+                {allVisibleSelected ? 'Deselect all' : `Select all ${filteredCards.length}${filteredCards.length < cards.length ? ' shown' : ''}`}
+              </span>
+            </label>
+            {selectedCardIds.length > 0 && (
+              <span className="text-cyan-300">
+                {selectedCardIds.length} of {filteredCards.length} selected
+              </span>
+            )}
+          </div>
+        )}
+
         {/* Selected Items Bulk Actions Strip */}
         {selectedCardIds.length > 0 && (
           <div className="bg-cyan-950/40 border border-cyan-500/40 rounded-xl p-3 flex items-center justify-between text-xs font-mono shadow-lg">
@@ -458,8 +478,9 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
               <button
                 onClick={handleDownloadImages}
                 className="px-3 py-1 bg-white/10 text-white border border-white/20 rounded-lg font-bold uppercase tracking-wider hover:bg-white/20 text-xs shadow-md"
+                title="Download selected cards as one ZIP: CSV plus front/back images"
               >
-                Images
+                CSV + Images (ZIP)
               </button>
               <button
                 id="bulk-download-csv-button"
@@ -530,7 +551,7 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
                 <div
                   onClick={(e) => toggleSelectCard(card.id, e)}
                   className={`absolute top-6 left-6 z-20 w-5 h-5 rounded border flex items-center justify-center transition-all ${
-                    isSelected ? 'bg-cyan-500 border-cyan-400 text-black font-black' : 'bg-black/80 border-white/20 opacity-0 group-hover:opacity-100'
+                    isSelected ? 'bg-cyan-500 border-cyan-400 text-black font-black' : `bg-black/80 border-white/20 ${selectedCardIds.length > 0 ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`
                   }`}
                 >
                   {isSelected && <span className="text-xs">✓</span>}
@@ -608,9 +629,11 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
                 <tr>
                   <th className="p-3 w-10">
                     <input
+                      ref={tableSelectAllRef}
                       type="checkbox"
-                      checked={selectedCardIds.length === filteredCards.length}
+                      checked={allVisibleSelected}
                       onChange={toggleSelectAll}
+                      aria-label="Select all shown cards"
                       className="rounded border-white/20 bg-black text-cyan-500"
                     />
                   </th>
