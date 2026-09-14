@@ -17,7 +17,8 @@ import {
   ExternalLink,
   FileSpreadsheet,
   CheckCircle2,
-  DollarSign
+  DollarSign,
+  SlidersHorizontal
 } from 'lucide-react';
 import { CardRecord, CardCategory, GradingBrand, FilterOptions } from '../types';
 import { exportCardsToCsv, CsvExportSummary } from '../lib/csvExporter';
@@ -266,16 +267,27 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
           </div>
         </div>
 
-        {/* Direct CSV Export Option */}
-        <button
-          onClick={() => setIsExportModalOpen(true)}
-          disabled={cards.length === 0}
-          className="px-3.5 py-1.5 bg-[#050505] hover:bg-cyan-500/10 border border-white/10 hover:border-cyan-500/40 text-cyan-300 rounded-xl text-xs font-bold uppercase tracking-wider flex items-center space-x-2 transition-all shadow-sm"
-          title="Export Collection to CSV Spreadsheet"
-        >
-          <FileSpreadsheet className="w-3.5 h-3.5" />
-          <span>Export Options</span>
-        </button>
+        {/* Quick CSV Download & Options */}
+        <div className="flex items-center space-x-2">
+          <button
+            id="stats-download-csv-button"
+            onClick={() => handleExportCsv(selectedCardIds.length > 0 ? 'selected' : (filteredCards.length < cards.length ? 'filtered' : 'all'))}
+            disabled={cards.length === 0}
+            className="px-3.5 py-1.5 bg-[#050505] hover:bg-cyan-500/15 border border-white/10 hover:border-cyan-500/40 text-cyan-300 rounded-xl text-xs font-bold uppercase tracking-wider flex items-center space-x-2 transition-all shadow-sm disabled:opacity-40 disabled:cursor-not-allowed active:scale-95"
+            title="Download CSV spreadsheet of collection"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>Download CSV</span>
+          </button>
+          <button
+            onClick={() => setIsExportModalOpen(true)}
+            disabled={cards.length === 0}
+            className="p-1.5 bg-[#050505] hover:bg-white/10 border border-white/10 text-gray-400 hover:text-white rounded-xl text-xs transition-all disabled:opacity-40"
+            title="CSV Export Options & Scope Settings"
+          >
+            <SlidersHorizontal className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
 
       {/* Top Filter & Search Bar */}
@@ -317,24 +329,35 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
               </button>
             </div>
 
-            {/* Export to CSV Button */}
-            <button
-              id="export-to-csv-button"
-              onClick={() => setIsExportModalOpen(true)}
-              disabled={cards.length === 0}
-              className={`px-3.5 py-2 bg-[#050505] hover:bg-white/10 border border-white/15 text-gray-200 text-xs font-mono font-bold uppercase tracking-wider rounded-xl flex items-center space-x-2 transition-all shadow-sm ${
-                cards.length === 0 ? 'opacity-40 cursor-not-allowed' : 'hover:border-cyan-500/50 hover:text-white'
-              }`}
-              title="Export Card Catalog to CSV (including values, grading info, and subgrades)"
-            >
-              <FileSpreadsheet className="w-4 h-4 text-cyan-400" />
-              <span>Export to CSV</span>
-              {selectedCardIds.length > 0 && (
-                <span className="px-1.5 py-0.5 bg-cyan-500/20 text-cyan-300 rounded text-[10px] border border-cyan-500/30">
-                  {selectedCardIds.length}
-                </span>
-              )}
-            </button>
+            {/* Download CSV Split Button Group */}
+            <div className="flex items-center bg-[#050505] rounded-xl border border-white/15 overflow-hidden shadow-sm">
+              <button
+                id="download-csv-button"
+                onClick={() => handleExportCsv(selectedCardIds.length > 0 ? 'selected' : (filteredCards.length < cards.length ? 'filtered' : 'all'))}
+                disabled={cards.length === 0}
+                className={`px-3.5 py-2 hover:bg-white/10 text-gray-200 text-xs font-mono font-bold uppercase tracking-wider flex items-center space-x-2 transition-all ${
+                  cards.length === 0 ? 'opacity-40 cursor-not-allowed' : 'hover:border-cyan-500/50 hover:text-white'
+                }`}
+                title="Download collection records as CSV for Excel, Google Sheets, or Numbers"
+              >
+                <Download className="w-4 h-4 text-cyan-400" />
+                <span>Download CSV</span>
+                {selectedCardIds.length > 0 && (
+                  <span className="px-1.5 py-0.5 bg-cyan-500/20 text-cyan-300 rounded text-[10px] border border-cyan-500/30">
+                    {selectedCardIds.length}
+                  </span>
+                )}
+              </button>
+              <button
+                id="download-csv-options-button"
+                onClick={() => setIsExportModalOpen(true)}
+                disabled={cards.length === 0}
+                className="px-2.5 py-2 border-l border-white/10 hover:bg-white/10 text-gray-400 hover:text-cyan-300 transition-all disabled:opacity-40"
+                title="CSV export options (scope selector, custom filename, summary preview)"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5" />
+              </button>
+            </div>
 
             <button
               onClick={onNavigateToScan}
@@ -439,13 +462,13 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
                 Images
               </button>
               <button
-                id="bulk-export-csv-button"
+                id="bulk-download-csv-button"
                 onClick={() => handleExportCsv('selected')}
                 className="px-3 py-1.5 bg-cyan-500 text-black rounded-lg font-black uppercase tracking-wider hover:bg-cyan-400 text-xs shadow-[0_0_12px_rgba(6,182,212,0.3)] flex items-center space-x-1.5 transition-all active:scale-95"
-                title="Export selected cards to CSV spreadsheet"
+                title="Download CSV spreadsheet of selected cards"
               >
-                <FileSpreadsheet className="w-3.5 h-3.5" />
-                <span>Export CSV ({selectedCardIds.length})</span>
+                <Download className="w-3.5 h-3.5" />
+                <span>Download CSV ({selectedCardIds.length})</span>
               </button>
               <button
                 onClick={() => {
@@ -649,12 +672,27 @@ export const CollectionDatabase: React.FC<CollectionDatabaseProps> = ({
                       ${card.estimatedValue || 0}
                     </td>
                     <td className="p-3 text-center" onClick={(e) => e.stopPropagation()}>
-                      <button
-                        onClick={() => onOpenCardDetail(card)}
-                        className="p-1.5 rounded-lg text-gray-400 hover:text-cyan-300 hover:bg-white/5"
-                      >
-                        <Eye className="w-4 h-4" />
-                      </button>
+                      <div className="flex items-center justify-center space-x-1">
+                        <button
+                          onClick={() => onOpenCardDetail(card)}
+                          className="p-1.5 rounded-lg text-gray-400 hover:text-cyan-300 hover:bg-white/5 transition-colors"
+                          title="View Card Details"
+                        >
+                          <Eye className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={() => {
+                            const safeName = (card.name || 'card').replace(/[^a-z0-9]/gi, '_').toLowerCase();
+                            exportCardsToCsv([card], `${safeName}_${card.cardNumber || 'card'}.csv`);
+                            setToastMessage(`✓ Downloaded CSV for "${card.name}"`);
+                            setTimeout(() => setToastMessage(null), 3000);
+                          }}
+                          className="p-1.5 rounded-lg text-gray-400 hover:text-emerald-400 hover:bg-white/5 transition-colors"
+                          title="Download CSV record for this card"
+                        >
+                          <Download className="w-4 h-4" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}

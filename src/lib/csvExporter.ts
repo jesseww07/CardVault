@@ -75,7 +75,9 @@ export function generateCardsCsv(cards: CardRecord[]): string {
     'Front OCR Text',
     'Back OCR Text',
     'Date Added',
-    'Last Updated'
+    'Last Updated',
+    'Scan Batch ID',
+    'Slot Index'
   ];
 
   const rows = cards.map((c) => {
@@ -104,7 +106,9 @@ export function generateCardsCsv(cards: CardRecord[]): string {
       escapeCsvValue(c.frontOcrText || ''),
       escapeCsvValue(c.backOcrText || ''),
       escapeCsvValue(formatDate(c.createdAt)),
-      escapeCsvValue(formatDate(c.updatedAt))
+      escapeCsvValue(formatDate(c.updatedAt)),
+      escapeCsvValue(c.scanBatchId || ''),
+      escapeCsvValue(c.slotIndex !== undefined ? c.slotIndex + 1 : '')
     ].join(',');
   });
 
